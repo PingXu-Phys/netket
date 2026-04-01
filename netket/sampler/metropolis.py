@@ -824,3 +824,51 @@ def MetropolisFermionHop(
         spin_symmetric=spin_symmetric,
     )
     return MetropolisSampler(hilbert, rule, dtype=dtype, **kwargs)
+
+
+def MetropolisFermionHopWithProposal(
+    hilbert,
+    *,
+    occupations,
+    clusters=None,
+    graph=None,
+    d_max=1,
+    spin_symmetric=True,
+    dtype=np.int8,
+    **kwargs,
+) -> MetropolisSampler:
+    r"""
+    This sampler moves (or hops) a random particle to a different empty mode,
+    using occupation-biased proposal probabilities.
+
+    Args:
+        hilbert: The Hilbert space to sample.
+        occupations: Mean occupations for each orbital or mode. The length must
+            be either ``hilbert.n_orbitals`` or ``hilbert.size``.
+        d_max: The maximum graph distance allowed for exchanges.
+        spin_symmetric: (default True) If True, exchanges are only allowed between
+            modes with the same spin projection.
+        n_chains: The total number of independent Markov chains across all JAX
+            devices. Either specify this or `n_chains_per_rank`.
+        n_chains_per_rank: Number of independent chains on every JAX device
+            (default = 16).
+        sweep_size: Number of sweeps for each step along the chain. Defaults to
+            the number of sites in the Hilbert space. This is equivalent to
+            subsampling the Markov chain.
+        reset_chains: If True, resets the chain state when `reset` is called on
+            every new sampling (default = False).
+        machine_pow: The power to which the machine should be exponentiated to
+            generate the pdf (default = 2).
+        dtype: The dtype of the states sampled (default = np.int8).
+    """
+    from .rules.fermion_2nd_proposal import FermionHopRule_with_proposal
+
+    rule = FermionHopRule_with_proposal(
+        hilbert,
+        occupations=occupations,
+        clusters=clusters,
+        graph=graph,
+        d_max=d_max,
+        spin_symmetric=spin_symmetric,
+    )
+    return MetropolisSampler(hilbert, rule, dtype=dtype, **kwargs)

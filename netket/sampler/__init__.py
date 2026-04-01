@@ -29,6 +29,7 @@ from .metropolis import (
     MetropolisGaussian,
     MetropolisAdjustedLangevin,
     MetropolisFermionHop,
+    MetropolisFermionHopWithProposal,
 )
 
 from .parallel_tempering import (
