@@ -42,13 +42,14 @@ class NOOptimizationConfig:
     lambda_occupancy : float
         Weight of C_γ — penalises off-diagonal 1-RDM elements.
         Acts as a *regulariser* that keeps the result close to the NO basis;
-        keep small (≪ lambda_kondo) to allow the optimiser to explore.
+        keep small (≪ lambda_interaction) to allow the optimiser to explore.
     lambda_hopping : float
         Weight of C_t — penalises delocalised / slowly-decaying hopping.
         Requires hopping_matrix or H to be supplied.
-    lambda_kondo : float
-        Weight of C_K — penalises large W_ab = Λ_ab · Ξ_ab (Kondo footprint
-        × phase space).  The main physical target. Requires exchange_profile.
+    lambda_interaction : float
+        Weight of C_int — penalises large W_ab = Λ_ab · Ξ_ab (interaction
+        footprint × phase space).  The main physical target.
+        Requires interaction_matrix.
     lambda_locality : float
         Weight of C_loc — IPR-based orbital localisation regulariser.
 
@@ -79,7 +80,7 @@ class NOOptimizationConfig:
 
     lambda_occupancy: float = 1.0
     lambda_hopping: float = 1.0
-    lambda_kondo: float = 1.0
+    lambda_interaction: float = 1.0
     lambda_locality: float = 0.1
     filled_tol: float = 0.05
     empty_tol: float = 0.05
@@ -155,23 +156,33 @@ def _resolve_distance_matrix(
     return distance_matrix
 
 
-def _resolve_exchange_profile(
-    exchange_profile: float | np.ndarray | None,
+def _resolve_interaction_matrix(
+    interaction_matrix: np.ndarray | None,
     n_sites: int,
-) -> np.ndarray:
-    if exchange_profile is None:
-        return np.ones(n_sites, dtype=float)
+) -> np.ndarray | None:
+    """Return a validated (n_sites, n_sites) interaction matrix, or None.
 
-    if np.isscalar(exchange_profile):
-        return np.full(n_sites, float(exchange_profile), dtype=float)
-
-    exchange_profile = np.asarray(exchange_profile, dtype=float)
-    if exchange_profile.shape != (n_sites,):
+    Accepts:
+      None          → disabled (returns None)
+      1-D (n,)      → treated as diagonal S = diag(J); shorthand for Kondo J_i
+      2-D (n, n)    → used as-is (general site-to-site coupling matrix)
+    """
+    if interaction_matrix is None:
+        return None
+    interaction_matrix = np.asarray(interaction_matrix, dtype=float)
+    if interaction_matrix.ndim == 1:
+        if interaction_matrix.shape != (n_sites,):
+            raise ValueError(
+                f"1-D interaction_matrix must have shape ({n_sites},), "
+                f"got {interaction_matrix.shape}."
+            )
+        return np.diag(interaction_matrix)
+    if interaction_matrix.shape != (n_sites, n_sites):
         raise ValueError(
-            "exchange_profile must be scalar or have shape "
-            f"({n_sites},), got {exchange_profile.shape}."
+            f"interaction_matrix must have shape ({n_sites}, {n_sites}), "
+            f"got {interaction_matrix.shape}."
         )
-    return exchange_profile
+    return interaction_matrix
 
 
 def _validate_no_reference_data(
@@ -277,7 +288,7 @@ def _validate_no_context(context: dict[str, Any]) -> dict[str, Any]:
         "distance_matrix",
         "hopping_matrix",
         "hopping_no",
-        "exchange_profile",
+        "interaction_matrix",
         "site_positions",
     )
     missing = [key for key in required_keys if key not in context]
@@ -330,10 +341,8 @@ def _validate_no_context(context: dict[str, Any]) -> dict[str, Any]:
                 f"{hopping_no.shape} and {(n_orbitals, n_orbitals)}."
             )
 
-    exchange_profile = (
-        None
-        if context["exchange_profile"] is None
-        else _resolve_exchange_profile(context["exchange_profile"], n_orbitals)
+    interaction_matrix = _resolve_interaction_matrix(
+        context["interaction_matrix"], n_orbitals
     )
 
     site_positions = None
@@ -356,9 +365,9 @@ def _validate_no_context(context: dict[str, Any]) -> dict[str, Any]:
         "distance_matrix": distance_matrix.copy(),
         "hopping_matrix": None if hopping_matrix is None else hopping_matrix.copy(),
         "hopping_no": None if hopping_no is None else hopping_no.copy(),
-        "exchange_profile": None
-        if exchange_profile is None
-        else exchange_profile.copy(),
+        "interaction_matrix": None
+        if interaction_matrix is None
+        else interaction_matrix.copy(),
         "site_positions": None if site_positions is None else site_positions.copy(),
     }
 
@@ -430,6 +439,83 @@ def extract_one_body_hopping_matrix(
     return _hermitian_part(sum(blocks) / float(len(blocks)))
 
 
+def extract_interaction_matrix(
+    H,
+    *,
+    spin_symmetric: bool = True,
+    cutoff: float | None = None,
+) -> np.ndarray:
+    """Build the site-to-site interaction strength matrix S from H's two-body terms.
+
+    For each normal-ordered term  V * c†_i c†_j c_k c_l  in H, the pair (i, j)
+    contributes |V| to  S[orb_i, orb_j]  (and symmetrically S[orb_j, orb_i]).
+
+    When spin_symmetric=True the spin index is stripped so S is indexed by
+    orbital only; contributions from all spin sectors are summed.
+
+    The resulting S is used as the interaction_matrix in the loss:
+        Lambda_ab = sum_ij  S_ij |U_ia|^2 |U_jb|^2
+
+    Parameters
+    ----------
+    H : FermionOperator2nd
+    spin_symmetric : bool
+        Strip spin index; return an (n_orb, n_orb) matrix.
+        When False return a (n_modes, n_modes) matrix.
+    cutoff : float, optional
+        Terms with |weight| <= cutoff are ignored.
+
+    Returns
+    -------
+    S : (n, n) float array  (non-negative, symmetric)
+    """
+    if not isinstance(H, FermionOperator2ndBase):
+        raise TypeError(
+            "H must be a FermionOperator2nd-compatible Hamiltonian, got "
+            f"{type(H)}."
+        )
+
+    hi = H.hilbert
+    inferred_cutoff = getattr(H, "cutoff", 0.0)
+    eff_cutoff = 0.0 if cutoff is None and inferred_cutoff is None else (
+        float(inferred_cutoff) if cutoff is None else float(cutoff)
+    )
+
+    op = H.to_normal_order()
+
+    if spin_symmetric and hi.n_spin_subsectors > 1:
+        n = hi.n_orbitals          # orbital dimension (per spin)
+        S = np.zeros((n, n), dtype=float)
+        for term, weight in op.operators.items():
+            if len(term) != 4 or abs(weight) <= eff_cutoff:
+                continue
+            (m1, d1), (m2, d2), (m3, d3), (m4, d4) = term
+            if d1 != 1 or d2 != 1 or d3 != 0 or d4 != 0:
+                continue
+            i = int(m1) % n        # orbital index (strip spin)
+            j = int(m2) % n
+            val = abs(weight)
+            S[i, j] += val
+            if i != j:
+                S[j, i] += val
+    else:
+        n = hi.size                # full mode dimension
+        S = np.zeros((n, n), dtype=float)
+        for term, weight in op.operators.items():
+            if len(term) != 4 or abs(weight) <= eff_cutoff:
+                continue
+            (m1, d1), (m2, d2), (m3, d3), (m4, d4) = term
+            if d1 != 1 or d2 != 1 or d3 != 0 or d4 != 0:
+                continue
+            i, j = int(m1), int(m2)
+            val = abs(weight)
+            S[i, j] += val
+            if i != j:
+                S[j, i] += val
+
+    return S
+
+
 def rotate_one_body_matrix(
     matrix: np.ndarray,
     site_to_orbital: np.ndarray,
@@ -454,42 +540,28 @@ def occupation_phase_space(diagonal_occupations: np.ndarray) -> np.ndarray:
     return n[:, None] * (1.0 - n[None, :]) + n[None, :] * (1.0 - n[:, None])
 
 
-def kondo_tensor_from_site_rotation(
+def interaction_footprint(
     site_to_orbital: np.ndarray,
-    *,
-    exchange_profile: float | np.ndarray | None = None,
+    interaction_matrix: np.ndarray,
 ) -> np.ndarray:
-    """Build K_iab = J_i U_ia^* U_ib in the rotated basis."""
-    site_to_orbital = _require_square_matrix(
-        site_to_orbital,
-        name="site_to_orbital",
-    ).astype(np.complex128)
-    exchange_profile = _resolve_exchange_profile(
-        exchange_profile,
-        site_to_orbital.shape[0],
-    )
-    return (
-        exchange_profile[:, None, None]
-        * site_to_orbital.conj()[:, :, None]
-        * site_to_orbital[:, None, :]
-    )
+    """Return Lambda_ab = sum_ij S_ij |U_ia|^2 |U_jb|^2.
 
+    Parameters
+    ----------
+    site_to_orbital : (n, n)
+        Transformation matrix U; column a = orbital a in site basis.
+    interaction_matrix : (n, n)
+        Site-to-site coupling matrix S_ij (symmetric, non-negative).
+        For Kondo J_i: pass np.diag(J).  For Heisenberg J_ij: pass J directly.
 
-def kondo_footprint(
-    site_to_orbital: np.ndarray,
-    *,
-    exchange_profile: float | np.ndarray | None = None,
-) -> np.ndarray:
-    """Return Lambda_ab = sum_i |J_i U_ia^* U_ib|."""
-    return np.sum(
-        np.abs(
-            kondo_tensor_from_site_rotation(
-                site_to_orbital,
-                exchange_profile=exchange_profile,
-            )
-        ),
-        axis=0,
-    )
+    Returns
+    -------
+    Lambda : (n, n)
+        Effective interaction footprint between orbital pairs.
+    """
+    U_sq = np.abs(np.asarray(site_to_orbital)) ** 2    # (n, n)  |U_ia|^2
+    S = np.asarray(interaction_matrix, dtype=float)
+    return U_sq.T @ S @ U_sq                            # (n, n)
 
 def _empty_structure_metrics() -> dict[str, float]:
     return {
@@ -626,7 +698,7 @@ def evaluate_basis_metrics(
     site_to_orbital: np.ndarray,
     *,
     hopping_matrix: np.ndarray | None = None,
-    exchange_profile: float | np.ndarray | None = None,
+    interaction_matrix: np.ndarray | None = None,
     distance_matrix: np.ndarray | None = None,
     site_positions: np.ndarray | None = None,
     config: NOOptimizationConfig | None = None,
@@ -681,14 +753,12 @@ def evaluate_basis_metrics(
 
     lambda_ab = None
     effective_scattering = None
-    kondo_metrics = _empty_structure_metrics()
-    if exchange_profile is not None:
-        lambda_ab = kondo_footprint(
-            site_to_orbital,
-            exchange_profile=exchange_profile,
-        )
+    interaction_metrics = _empty_structure_metrics()
+    if interaction_matrix is not None:
+        S = _resolve_interaction_matrix(interaction_matrix, site_to_orbital.shape[0])
+        lambda_ab = interaction_footprint(site_to_orbital, S)
         effective_scattering = lambda_ab * phase_space
-        kondo_metrics = pair_structure_metrics(
+        interaction_metrics = pair_structure_metrics(
             effective_scattering,
             distance_matrix=distance_matrix,
             power=config.distance_power,
@@ -698,7 +768,7 @@ def evaluate_basis_metrics(
     total_loss = (
         config.lambda_occupancy * occupation_offdiag_cost
         + config.lambda_hopping * hopping_metrics["structure_cost"]
-        + config.lambda_kondo * kondo_metrics["structure_cost"]
+        + config.lambda_interaction * interaction_metrics["structure_cost"]
         + config.lambda_locality * locality_metrics["locality_cost"]
     )
 
@@ -710,9 +780,9 @@ def evaluate_basis_metrics(
         "phase_space": phase_space,
         "rotated_hopping": rotated_hopping,
         "hopping_metrics": hopping_metrics,
-        "kondo_footprint": lambda_ab,
+        "interaction_footprint": lambda_ab,
         "effective_scattering": effective_scattering,
-        "kondo_metrics": kondo_metrics,
+        "interaction_metrics": interaction_metrics,
         "locality_metrics": locality_metrics,
     }
 
@@ -835,7 +905,6 @@ def inspect_occupation_structure(
                 f"occupations must be a one-dimensional array, got {occupations.shape}."
             )
 
-    occupations = np.asarray(occupations, dtype=float)
     blocks = build_occupation_blocks(
         occupations,
         filled_tol=config.filled_tol,
@@ -858,10 +927,11 @@ def prepare_no_optimization_context(
     *,
     H=None,
     rdm: np.ndarray,
+    active_indices: list | np.ndarray | None = None,
     natural_occupations: np.ndarray | None = None,
     natural_orbitals: np.ndarray | None = None,
     hopping_matrix: np.ndarray | None = None,
-    exchange_profile: float | np.ndarray | None = None,
+    interaction_matrix: np.ndarray | None = None,
     distance_matrix: np.ndarray | None = None,
     site_positions: np.ndarray | None = None,
     config: NOOptimizationConfig | None = None,
@@ -870,6 +940,36 @@ def prepare_no_optimization_context(
     """Bundle all inputs needed to define the post-NO loss and optimization."""
     config = _coerce_config(config)
     rdm = _hermitian_part(_require_square_matrix(rdm, name="rdm"))
+    n_full = rdm.shape[0]
+
+    # --- extract sub-matrices when active_indices is given ---
+    if active_indices is not None:
+        active_idx = np.asarray(active_indices, dtype=int)
+        if active_idx.ndim != 1 or np.any(active_idx < 0) or np.any(active_idx >= n_full):
+            raise ValueError(
+                f"active_indices must be a 1-D array of valid orbital indices "
+                f"in [0, {n_full - 1}], got {active_idx}."
+            )
+        ix = np.ix_(active_idx, active_idx)
+        rdm = rdm[ix]
+        if hopping_matrix is None and H is not None:
+            hopping_matrix = extract_one_body_hopping_matrix(H, spin_symmetric=spin_symmetric)
+        if hopping_matrix is not None:
+            hopping_matrix = np.asarray(hopping_matrix)[ix]
+        if interaction_matrix is None and H is not None:
+            interaction_matrix = extract_interaction_matrix(H, spin_symmetric=spin_symmetric)
+        if interaction_matrix is not None:
+            full_S = _resolve_interaction_matrix(interaction_matrix, n_full)
+            interaction_matrix = full_S[ix]
+        if distance_matrix is not None:
+            distance_matrix = np.asarray(distance_matrix)[ix]
+        if site_positions is not None:
+            pos = np.asarray(site_positions, dtype=float)
+            if pos.ndim == 1:
+                pos = pos[:, None]
+            site_positions = pos[active_idx]
+        natural_occupations = None
+        natural_orbitals = None
 
     if natural_occupations is None or natural_orbitals is None:
         natural_occupations, natural_orbitals = natural_orbitals_from_rdm(rdm)
@@ -899,10 +999,8 @@ def prepare_no_optimization_context(
         natural_orbitals.shape[0],
         distance_matrix,
     )
-    resolved_exchange = (
-        None
-        if exchange_profile is None
-        else _resolve_exchange_profile(exchange_profile, natural_orbitals.shape[0])
+    resolved_interaction = _resolve_interaction_matrix(
+        interaction_matrix, natural_orbitals.shape[0]
     )
 
     resolved_positions = None
@@ -926,7 +1024,7 @@ def prepare_no_optimization_context(
         rdm,
         natural_orbitals,
         hopping_matrix=hopping_matrix,
-        exchange_profile=resolved_exchange,
+        interaction_matrix=resolved_interaction,
         distance_matrix=resolved_distance,
         site_positions=resolved_positions,
         config=config,
@@ -942,9 +1040,9 @@ def prepare_no_optimization_context(
         "occupation_blocks": [block.copy() for block in occupation_blocks],
         "hopping_matrix": None if hopping_matrix is None else hopping_matrix.copy(),
         "hopping_no": None if hopping_no is None else hopping_no.copy(),
-        "exchange_profile": None
-        if resolved_exchange is None
-        else resolved_exchange.copy(),
+        "interaction_matrix": None
+        if resolved_interaction is None
+        else resolved_interaction.copy(),
         "distance_matrix": resolved_distance.copy(),
         "site_positions": None
         if resolved_positions is None
@@ -986,7 +1084,7 @@ def build_occupation_blocks(
     current_sector = sector(float(occupations[0]))
     for idx in range(1, occupations.size):
         next_sector = sector(float(occupations[idx]))
-        gap = abs(float(occupations[idx - 1]) - float(occupations[idx]))
+        gap = float(occupations[idx - 1]) - float(occupations[idx])
         if next_sector != current_sector or gap > degeneracy_tol:
             blocks.append(np.arange(start, idx, dtype=int))
             start = idx
@@ -1136,7 +1234,7 @@ def _loss_terms_jax(
     natural_occupations: jax.Array,
     natural_orbitals: jax.Array,
     hopping_no: jax.Array | None,
-    exchange_profile: jax.Array | None,
+    interaction_matrix: jax.Array | None,
     distance_matrix: jax.Array,
     site_positions: jax.Array | None,
     config: NOOptimizationConfig,
@@ -1158,22 +1256,16 @@ def _loss_terms_jax(
         )
 
     site_to_orbital = natural_orbitals @ post_no_rotation
-    kondo_cost = jnp.array(0.0)
-    if exchange_profile is not None:
-        lambda_ab = jnp.sum(
-            jnp.abs(
-                exchange_profile[:, None, None]
-                * jnp.conjugate(site_to_orbital)[:, :, None]
-                * site_to_orbital[:, None, :]
-            ),
-            axis=0,
-        )
+    interaction_cost = jnp.array(0.0)
+    if interaction_matrix is not None:
+        U_sq = jnp.abs(site_to_orbital) ** 2           # (n, n)  |U_ia|^2
+        lambda_ab = U_sq.T @ interaction_matrix @ U_sq  # (n, n)  Λ_ab
         diag_occ = jnp.clip(jnp.real(jnp.diag(gamma_rot)), 0.0, 1.0)
         phase_space = (
             diag_occ[:, None] * (1.0 - diag_occ[None, :])
             + diag_occ[None, :] * (1.0 - diag_occ[:, None])
         )
-        kondo_cost = _structure_cost_jax(
+        interaction_cost = _structure_cost_jax(
             lambda_ab * phase_space,
             distance_matrix=distance_matrix,
             power=config.distance_power,
@@ -1188,13 +1280,13 @@ def _loss_terms_jax(
     total = (
         config.lambda_occupancy * occupancy_cost
         + config.lambda_hopping * hopping_cost
-        + config.lambda_kondo * kondo_cost
+        + config.lambda_interaction * interaction_cost
         + config.lambda_locality * locality_cost
     )
     return jnp.real(total), (
         jnp.real(occupancy_cost),
         jnp.real(hopping_cost),
-        jnp.real(kondo_cost),
+        jnp.real(interaction_cost),
         jnp.real(locality_cost),
     )
 
@@ -1215,10 +1307,10 @@ def build_no_loss_fn(context: dict[str, Any]):
         None if _hop is None
         else jnp.asarray(np.real(_hop) if real_orbitals else _hop, dtype=arr_dtype)
     )
-    exchange_profile_jax = (
+    interaction_matrix_jax = (
         None
-        if validated["exchange_profile"] is None
-        else jnp.asarray(validated["exchange_profile"])
+        if validated["interaction_matrix"] is None
+        else jnp.asarray(validated["interaction_matrix"])
     )
     distance_matrix_jax = jnp.asarray(validated["distance_matrix"])
     site_positions_jax = (
@@ -1239,7 +1331,7 @@ def build_no_loss_fn(context: dict[str, Any]):
             natural_occupations=natural_occupations_jax,
             natural_orbitals=natural_orbitals_jax,
             hopping_no=hopping_no_jax,
-            exchange_profile=exchange_profile_jax,
+            interaction_matrix=interaction_matrix_jax,
             distance_matrix=distance_matrix_jax,
             site_positions=site_positions_jax,
             config=config,
@@ -1284,9 +1376,9 @@ def evaluate_no_loss(
         hopping_no=None
         if validated["hopping_no"] is None
         else jnp.asarray(validated["hopping_no"]),
-        exchange_profile=None
-        if validated["exchange_profile"] is None
-        else jnp.asarray(validated["exchange_profile"]),
+        interaction_matrix=None
+        if validated["interaction_matrix"] is None
+        else jnp.asarray(validated["interaction_matrix"]),
         distance_matrix=jnp.asarray(validated["distance_matrix"]),
         site_positions=None
         if validated["site_positions"] is None
@@ -1299,7 +1391,7 @@ def evaluate_no_loss(
         validated["rdm"],
         site_to_optimized_orbital,
         hopping_matrix=validated["hopping_matrix"],
-        exchange_profile=validated["exchange_profile"],
+        interaction_matrix=validated["interaction_matrix"],
         distance_matrix=validated["distance_matrix"],
         site_positions=validated["site_positions"],
         config=config,
@@ -1310,7 +1402,7 @@ def evaluate_no_loss(
         "loss_terms": {
             "occupancy": float(terms[0]),
             "hopping": float(terms[1]),
-            "kondo": float(terms[2]),
+            "interaction": float(terms[2]),
             "locality": float(terms[3]),
         },
         "post_no_rotation": post_no_rotation,
@@ -1331,7 +1423,7 @@ def optimize_no_from_context(
         natural_occupations=context["natural_occupations"],
         natural_orbitals=context["natural_orbitals"],
         hopping_matrix=context["hopping_matrix"],
-        exchange_profile=context["exchange_profile"],
+        interaction_matrix=context["interaction_matrix"],
         distance_matrix=context["distance_matrix"],
         site_positions=context["site_positions"],
         config=context["config"],
@@ -1345,7 +1437,7 @@ def _metrics_summary(step: int, metrics: dict[str, object]) -> dict[str, object]
         "loss": float(metrics["loss"]),
         "occupation_offdiag_cost": float(metrics["occupation_offdiag_cost"]),
         "hopping_structure_cost": float(metrics["hopping_metrics"]["structure_cost"]),
-        "kondo_structure_cost": float(metrics["kondo_metrics"]["structure_cost"]),
+        "interaction_structure_cost": float(metrics["interaction_metrics"]["structure_cost"]),
         "locality_cost": float(metrics["locality_metrics"]["locality_cost"]),
         "diag_occupations": np.asarray(metrics["diag_occupations"], dtype=float).copy(),
     }
@@ -1355,10 +1447,11 @@ def optimize_no_basis(
     *,
     H=None,
     rdm: np.ndarray,
+    active_indices: list | np.ndarray | None = None,
     natural_occupations: np.ndarray | None = None,
     natural_orbitals: np.ndarray | None = None,
     hopping_matrix: np.ndarray | None = None,
-    exchange_profile: float | np.ndarray | None = None,
+    interaction_matrix: np.ndarray | None = None,
     distance_matrix: np.ndarray | None = None,
     site_positions: np.ndarray | None = None,
     config: NOOptimizationConfig | None = None,
@@ -1379,12 +1472,18 @@ def optimize_no_basis(
         Full second-quantised Hamiltonian.  If given, the one-body hopping
         matrix is extracted automatically (overrides ``hopping_matrix``), and
         the returned ``optimised_hamiltonian`` is H rotated into the new basis.
+    active_indices : list or (k,) int array, optional
+        Orbital indices on which to perform the 1-RDM diagonalisation and
+        basis rotation.  All other orbitals are left unchanged (identity
+        rotation).  When omitted all orbitals are active.
     hopping_matrix : (n, n) array, optional
         One-body hopping/kinetic matrix tᵢⱼ in the current basis.
-        Used for the C_t sparsity cost.  Ignored when H is supplied.
-    exchange_profile : scalar or (n,) array, optional
-        On-site Kondo coupling Jᵢ.  Enables the C_K term.  Pass ``None`` to
-        disable the Kondo cost entirely.
+        Extracted automatically from H when H is supplied.
+    interaction_matrix : (n,) or (n, n) array, optional
+        Site-to-site interaction strength matrix Sᵢⱼ.  Enables the C_int term.
+        Extracted automatically from H when H is supplied (= Σ_{kl}|V_{ijkl}|).
+        Pass a 1-D array J_i for Kondo-style diagonal coupling (diag(J) used);
+        pass a 2-D array for general Heisenberg / Coulomb / arbitrary interactions.
     distance_matrix : (n, n) array, optional
         Pairwise distances dₐᵦ used to score hopping / Kondo decay.
         Defaults to |a − b| (1-D index distance).
@@ -1442,8 +1541,8 @@ def optimize_no_basis(
         Diagonal occupation numbers in the optimised basis.
     optimized_hopping_matrix : (n, n) or None
         Hopping matrix in the optimised basis.
-    kondo_footprint : (n, n) or None
-        Λ_ab = Σᵢ |Jᵢ Uᵢₐ* Uᵢᵦ|  in the optimised basis.
+    interaction_footprint : (n, n) or None
+        Λ_ab = Σᵢⱼ Sᵢⱼ |Uᵢₐ|² |Uⱼᵦ|²  in the optimised basis.
     effective_scattering : (n, n) or None
         W_ab = Λ_ab · Ξ_ab  in the optimised basis.
     optimized_hamiltonian : FermionOperator2nd or None
@@ -1451,11 +1550,122 @@ def optimize_no_basis(
     initial_metrics, final_metrics : dict
         Full diagnostic snapshots before and after optimisation.
     final_loss_terms : dict
-        {"occupancy", "hopping", "kondo", "locality"} breakdown.
+        {"occupancy", "hopping", "interaction", "locality"} breakdown.
     history : list of dicts
         Metrics logged every ``config.log_every`` steps.
     """
     config = _coerce_config(config)
+
+    # ── active-subspace shortcut ──────────────────────────────────────────
+    if active_indices is not None:
+        active_idx = np.asarray(active_indices, dtype=int)
+        rdm_full = _hermitian_part(_require_square_matrix(rdm, name="rdm"))
+        n_full = rdm_full.shape[0]
+        if active_idx.ndim != 1 or np.any(active_idx < 0) or np.any(active_idx >= n_full):
+            raise ValueError(
+                f"active_indices must be a 1-D array of valid site indices in [0, {n_full})."
+            )
+        ix = np.ix_(active_idx, active_idx)
+
+        # Sub-matrices for all optional inputs
+        hop_sub = None
+        if hopping_matrix is not None:
+            hop_sub = np.asarray(hopping_matrix)[ix]
+        elif H is not None:
+            hop_sub = extract_one_body_hopping_matrix(H, spin_symmetric=spin_symmetric)[ix]
+
+        int_sub = None
+        if interaction_matrix is not None:
+            int_sub = _resolve_interaction_matrix(interaction_matrix, n_full)[ix]
+        elif H is not None:
+            int_sub = extract_interaction_matrix(H, spin_symmetric=spin_symmetric)[ix]
+
+        dist_sub = None if distance_matrix is None else np.asarray(distance_matrix)[ix]
+        pos_sub = None
+        if site_positions is not None:
+            pos_sub = np.asarray(site_positions, dtype=float)[active_idx]
+
+        # Optimize on the restricted sub-problem
+        sub_result = optimize_no_basis(
+            rdm=rdm_full[ix],
+            hopping_matrix=hop_sub,
+            interaction_matrix=int_sub,
+            distance_matrix=dist_sub,
+            site_positions=pos_sub,
+            config=config,
+            optimizer=optimizer,
+            spin_symmetric=spin_symmetric,
+            active_indices=None,  # already restricted; prevent infinite recursion
+        )
+
+        # Build full-space U_full: identity with the active block replaced
+        arr_dtype = np.float64 if config.real_orbitals else np.complex128
+        U_full = np.eye(n_full, dtype=arr_dtype)
+        U_sub = np.asarray(sub_result["site_to_optimized_orbital"])
+        rows, cols = np.meshgrid(active_idx, active_idx, indexing="ij")
+        U_full[rows, cols] = U_sub
+
+        # Rotate the full Hamiltonian if supplied
+        optimized_hamiltonian = None
+        mode_rotation = None
+        if H is not None:
+            if not isinstance(H, FermionOperator2ndBase):
+                raise TypeError(
+                    "H must be a FermionOperator2nd-compatible Hamiltonian, got "
+                    f"{type(H)}."
+                )
+            mode_rotation = (
+                _expand_orbital_rotation_to_modes(H.hilbert, U_full)
+                if spin_symmetric
+                else U_full
+            )
+            optimized_hamiltonian = rotate_fermion_hamiltonian(
+                H, mode_rotation, cutoff=config.hamiltonian_cutoff
+            )
+
+        # Full-space metrics for reporting
+        hop_full_mat = hopping_matrix
+        if hop_full_mat is None and H is not None:
+            hop_full_mat = extract_one_body_hopping_matrix(H, spin_symmetric=spin_symmetric)
+        int_full_mat = interaction_matrix
+        if int_full_mat is None and H is not None:
+            int_full_mat = extract_interaction_matrix(H, spin_symmetric=spin_symmetric)
+
+        full_init = evaluate_basis_metrics(
+            rdm_full, np.eye(n_full, dtype=arr_dtype),
+            hopping_matrix=hop_full_mat, interaction_matrix=int_full_mat,
+            distance_matrix=distance_matrix, site_positions=site_positions, config=config,
+        )
+        full_final = evaluate_basis_metrics(
+            rdm_full, U_full,
+            hopping_matrix=hop_full_mat, interaction_matrix=int_full_mat,
+            distance_matrix=distance_matrix, site_positions=site_positions, config=config,
+        )
+
+        return {
+            **sub_result,
+            "active_indices": active_idx.copy(),
+            "site_to_optimized_orbital": U_full,
+            "mode_rotation": mode_rotation,
+            "optimized_hamiltonian": optimized_hamiltonian,
+            "initial_metrics": full_init,
+            "final_metrics": full_final,
+            "optimized_rdm": full_final["rdm_in_basis"].copy(),
+            "optimized_diag_occupations": np.asarray(
+                full_final["diag_occupations"], dtype=float
+            ).copy(),
+            "optimized_hopping_matrix": None
+            if full_final["rotated_hopping"] is None
+            else full_final["rotated_hopping"].copy(),
+            "interaction_footprint": None
+            if full_final["interaction_footprint"] is None
+            else full_final["interaction_footprint"].copy(),
+            "effective_scattering": None
+            if full_final["effective_scattering"] is None
+            else full_final["effective_scattering"].copy(),
+        }
+    # ── end active-subspace shortcut ─────────────────────────────────────
+
     rdm = _hermitian_part(_require_square_matrix(rdm, name="rdm"))
 
     if natural_occupations is None or natural_orbitals is None:
@@ -1493,7 +1703,7 @@ def optimize_no_basis(
         rdm,
         natural_orbitals,
         hopping_matrix=hopping_matrix,
-        exchange_profile=exchange_profile,
+        interaction_matrix=interaction_matrix,
         distance_matrix=distance_matrix,
         site_positions=site_positions,
         config=config,
@@ -1511,7 +1721,7 @@ def optimize_no_basis(
         final_loss_terms = {
             "occupancy": float(initial_metrics["occupation_offdiag_cost"]),
             "hopping": float(initial_metrics["hopping_metrics"]["structure_cost"]),
-            "kondo": float(initial_metrics["kondo_metrics"]["structure_cost"]),
+            "interaction": float(initial_metrics["interaction_metrics"]["structure_cost"]),
             "locality": float(initial_metrics["locality_metrics"]["locality_cost"]),
         }
     else:
@@ -1527,11 +1737,11 @@ def optimize_no_basis(
         hopping_no_jax = None if hopping_no is None else jnp.asarray(
             np.real(hopping_no) if real_orbitals else hopping_no, dtype=jax_dtype
         )
-        exchange_profile_jax = (
+        interaction_matrix_jax = (
             None
-            if exchange_profile is None
+            if interaction_matrix is None
             else jnp.asarray(
-                _resolve_exchange_profile(exchange_profile, natural_orbitals.shape[0])
+                _resolve_interaction_matrix(interaction_matrix, natural_orbitals.shape[0])
             )
         )
         site_positions_jax = None
@@ -1562,7 +1772,7 @@ def optimize_no_basis(
                 natural_occupations=natural_occupations_jax,
                 natural_orbitals=natural_orbitals_jax,
                 hopping_no=hopping_no_jax,
-                exchange_profile=exchange_profile_jax,
+                interaction_matrix=interaction_matrix_jax,
                 distance_matrix=distance_matrix_jax,
                 site_positions=site_positions_jax,
                 config=config,
@@ -1585,7 +1795,7 @@ def optimize_no_basis(
                     rdm,
                     current_rotation,
                     hopping_matrix=hopping_matrix,
-                    exchange_profile=exchange_profile,
+                    interaction_matrix=interaction_matrix,
                     distance_matrix=resolved_distance,
                     site_positions=site_positions,
                     config=config,
@@ -1594,25 +1804,16 @@ def optimize_no_basis(
                 entry["optax_loss"] = float(loss_value)
                 history.append(entry)
 
-        final_post_no_rotation = np.asarray(
-            _build_post_no_rotation(params, blocks, n_orbitals, real_orbitals=real_orbitals)
-        )
-        current_rotation = natural_orbitals @ final_post_no_rotation
-        final_metrics = evaluate_basis_metrics(
-            rdm,
-            current_rotation,
-            hopping_matrix=hopping_matrix,
-            exchange_profile=exchange_profile,
-            distance_matrix=resolved_distance,
-            site_positions=site_positions,
-            config=config,
-        )
+        # The loop always logs at step == n_steps, so post_no_rotation / current_rotation /
+        # metrics are already current — reuse them instead of recomputing.
+        final_post_no_rotation = post_no_rotation
+        final_metrics = metrics
         _, final_terms = _loss_terms_jax(
             jnp.asarray(final_post_no_rotation),
             natural_occupations=natural_occupations_jax,
             natural_orbitals=natural_orbitals_jax,
             hopping_no=hopping_no_jax,
-            exchange_profile=exchange_profile_jax,
+            interaction_matrix=interaction_matrix_jax,
             distance_matrix=distance_matrix_jax,
             site_positions=site_positions_jax,
             config=config,
@@ -1620,7 +1821,7 @@ def optimize_no_basis(
         final_loss_terms = {
             "occupancy": float(final_terms[0]),
             "hopping": float(final_terms[1]),
-            "kondo": float(final_terms[2]),
+            "interaction": float(final_terms[2]),
             "locality": float(final_terms[3]),
         }
 
@@ -1666,9 +1867,9 @@ def optimize_no_basis(
         "optimized_hopping_matrix": None
         if final_metrics["rotated_hopping"] is None
         else final_metrics["rotated_hopping"].copy(),
-        "kondo_footprint": None
-        if final_metrics["kondo_footprint"] is None
-        else final_metrics["kondo_footprint"].copy(),
+        "interaction_footprint": None
+        if final_metrics["interaction_footprint"] is None
+        else final_metrics["interaction_footprint"].copy(),
         "effective_scattering": None
         if final_metrics["effective_scattering"] is None
         else final_metrics["effective_scattering"].copy(),
@@ -1684,11 +1885,11 @@ __all__ = [
     "create_optax_optimizer",
     "evaluate_basis_metrics",
     "evaluate_no_loss",
+    "extract_interaction_matrix",
     "extract_one_body_hopping_matrix",
     "extract_hamiltonian_terms",
     "inspect_occupation_structure",
-    "kondo_footprint",
-    "kondo_tensor_from_site_rotation",
+    "interaction_footprint",
     "occupation_phase_space",
     "optimize_no_basis",
     "optimize_no_from_context",
