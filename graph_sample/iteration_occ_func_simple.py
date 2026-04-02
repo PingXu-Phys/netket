@@ -123,7 +123,7 @@ def _canonicalize_eigenvectors(vecs: np.ndarray) -> np.ndarray:
     """
     Fix the arbitrary phase of each eigenvector for reproducible rotations.
     """
-    vecs = np.array(vecs, copy=True)
+    vecs = np.array(vecs, dtype=np.complex128, copy=True)
     for col in range(vecs.shape[1]):
         column = vecs[:, col]
         # Use the largest-magnitude entry to set a stable global phase.
