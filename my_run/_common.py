@@ -100,7 +100,7 @@ _MODEL_FAMILY_BY_NAME = {
 _MODELS_WITH_HIDDEN_UNITS = set(ALL_MODELS) - {"agp"}
 _MODELS_WITH_INIT_BACKFLOW_SCALE = {"agp-backflow", "agp-backflow-deep"}
 
-# Shared linear solvers exposed by both `nk.optimizer.SR` and `nk.driver.VMC_SR`.
+# Shared linear solvers exposed by `nk.driver.VMC_SR`.
 LINEAR_SOLVER_BUILDERS = {
     "LU": nk.optimizer.solver.LU,
     "cholesky": nk.optimizer.solver.cholesky,
@@ -108,15 +108,6 @@ LINEAR_SOLVER_BUILDERS = {
     "pinv_smooth": nk.optimizer.solver.pinv_smooth,
     "solve": nk.optimizer.solver.solve,
     "svd": nk.optimizer.solver.svd,
-}
-
-_SR_SOLVER_BUILDERS = LINEAR_SOLVER_BUILDERS
-
-_SR_QGT_BUILDERS = {
-    "QGTAuto": nk.optimizer.qgt.QGTAuto,
-    "QGTJacobianDense": nk.optimizer.qgt.QGTJacobianDense,
-    "QGTJacobianPyTree": nk.optimizer.qgt.QGTJacobianPyTree,
-    "QGTOnTheFly": nk.optimizer.qgt.QGTOnTheFly,
 }
 
 
@@ -322,15 +313,74 @@ def add_vmc_driver_arguments(
     driver_default="vmc-sr",
     optimizer_choices=("sgd", "adam"),
     optimizer_default="adam",
+    optimizer_schedule_default="constant",
     learning_rate_default: float,
+    learning_rate_end_default: float = 5.0e-5,
+    optimizer_warmup_fraction_default: float = 0.05,
+    clip_grad_norm_default: float = 0.0,
+    optimizer_weight_decay_default: float = 1.0e-4,
+    optimizer_momentum_default: float = 0.0,
+    adam_b1_default: float = 0.9,
+    adam_b2_default: float = 0.999,
+    adam_eps_default: float = 1.0e-8,
+    rmsprop_decay_default: float = 0.9,
+    rmsprop_eps_default: float = 1.0e-7,
     diag_shift_default: float,
     linear_solver_default="cholesky",
     mode_default="real",
 ) -> None:
-    """Add a shared VMC/VMC_SR argument block for lightweight runners."""
+    """Add the shared VMC/VMC_SR optimizer-driver block used across runners."""
+    optimizer_choices = tuple(dict.fromkeys((*optimizer_choices, "adamw", "rmsprop")))
+
     container.add_argument("--driver", choices=tuple(driver_choices), default=driver_default)
-    container.add_argument("--optimizer", choices=tuple(optimizer_choices), default=optimizer_default)
-    container.add_argument("--learning-rate", type=float, default=float(learning_rate_default))
+    container.add_argument("--optimizer", choices=optimizer_choices, default=optimizer_default)
+    container.add_argument(
+        "--optimizer-schedule",
+        choices=("constant", "warmup-cosine"),
+        default=optimizer_schedule_default,
+        help="Learning-rate schedule for the outer optimizer.",
+    )
+    container.add_argument(
+        "--learning-rate",
+        type=float,
+        default=float(learning_rate_default),
+        help="Base learning rate, or the peak value for warmup-cosine schedules.",
+    )
+    container.add_argument(
+        "--learning-rate-end",
+        type=float,
+        default=float(learning_rate_end_default),
+        help="End value used only by the warmup-cosine learning-rate schedule.",
+    )
+    container.add_argument(
+        "--optimizer-warmup-fraction",
+        type=float,
+        default=float(optimizer_warmup_fraction_default),
+        help="Warmup fraction used by the warmup-cosine learning-rate schedule.",
+    )
+    container.add_argument(
+        "--clip-grad-norm",
+        type=float,
+        default=float(clip_grad_norm_default),
+        help="Global gradient clipping norm applied before the outer optimizer. <= 0 disables clipping.",
+    )
+    container.add_argument(
+        "--optimizer-weight-decay",
+        type=float,
+        default=float(optimizer_weight_decay_default),
+        help="Weight decay used by adamw.",
+    )
+    container.add_argument(
+        "--optimizer-momentum",
+        type=float,
+        default=float(optimizer_momentum_default),
+        help="Momentum used by optax.sgd.",
+    )
+    container.add_argument("--adam-b1", type=float, default=float(adam_b1_default))
+    container.add_argument("--adam-b2", type=float, default=float(adam_b2_default))
+    container.add_argument("--adam-eps", type=float, default=float(adam_eps_default))
+    container.add_argument("--rmsprop-decay", type=float, default=float(rmsprop_decay_default))
+    container.add_argument("--rmsprop-eps", type=float, default=float(rmsprop_eps_default))
     container.add_argument("--diag-shift", type=float, default=float(diag_shift_default))
     container.add_argument("--proj-reg", type=float, default=None)
     container.add_argument(
@@ -377,7 +427,18 @@ def collect_vmc_driver_config(args) -> dict[str, object]:
         args,
         "driver",
         "optimizer",
+        "optimizer_schedule",
         "learning_rate",
+        "learning_rate_end",
+        "optimizer_warmup_fraction",
+        "clip_grad_norm",
+        "optimizer_weight_decay",
+        "optimizer_momentum",
+        "adam_b1",
+        "adam_b2",
+        "adam_eps",
+        "rmsprop_decay",
+        "rmsprop_eps",
         "diag_shift",
     )
     config["preconditioner"] = None
@@ -414,13 +475,63 @@ def collect_vmc_driver_config(args) -> dict[str, object]:
     return config
 
 
+def _lightweight_optimizer_learning_rate(args):
+    """Build the learning-rate object consumed by lightweight outer optimizers."""
+    if getattr(args, "optimizer_schedule", "constant") == "constant":
+        return float(args.learning_rate)
+
+    steps = max(1, int(getattr(args, "n_iter", 1)))
+    warmup_steps = max(
+        1,
+        int(max(1, steps) * float(getattr(args, "optimizer_warmup_fraction", 0.05))),
+    )
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=float(args.learning_rate),
+        warmup_steps=warmup_steps,
+        decay_steps=max(1, steps),
+        end_value=float(getattr(args, "learning_rate_end", args.learning_rate)),
+    )
+
+
 def build_basic_optimizer(args):
-    """Build a simple outer optimizer shared by lightweight VMC runners."""
-    if args.optimizer == "sgd":
-        return optax.sgd(float(args.learning_rate))
+    """Build a configurable outer optimizer shared by lightweight VMC runners."""
+    learning_rate = _lightweight_optimizer_learning_rate(args)
+
     if args.optimizer == "adam":
-        return nk.optimizer.Adam(learning_rate=float(args.learning_rate))
-    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+        optimizer = optax.adam(
+            learning_rate=learning_rate,
+            b1=float(args.adam_b1),
+            b2=float(args.adam_b2),
+            eps=float(args.adam_eps),
+        )
+    elif args.optimizer == "adamw":
+        optimizer = optax.adamw(
+            learning_rate=learning_rate,
+            b1=float(args.adam_b1),
+            b2=float(args.adam_b2),
+            eps=float(args.adam_eps),
+            weight_decay=float(args.optimizer_weight_decay),
+        )
+    elif args.optimizer == "sgd":
+        optimizer = optax.sgd(
+            learning_rate=learning_rate,
+            momentum=float(args.optimizer_momentum),
+        )
+    elif args.optimizer == "rmsprop":
+        optimizer = optax.rmsprop(
+            learning_rate=learning_rate,
+            decay=float(args.rmsprop_decay),
+            eps=float(args.rmsprop_eps),
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+    clip_grad_norm = float(getattr(args, "clip_grad_norm", 0.0))
+    if clip_grad_norm > 0.0:
+        optimizer = optax.chain(optax.clip_by_global_norm(clip_grad_norm), optimizer)
+
+    return optimizer
 
 
 def build_vmc_or_vmc_sr_driver(hamiltonian, vstate, optimizer, args):
@@ -538,8 +649,8 @@ def base_parser(
 
 
 
-def add_model_optimizer_sr_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add SIAM model-variant controls plus outer optimizer / SR knobs."""
+def add_model_driver_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add SIAM model-variant controls plus the shared VMC/VMC_SR driver knobs."""
     model_group = parser.add_argument_group("Model variants")
     model_group.add_argument(
         "--n-layers",
@@ -558,83 +669,29 @@ def add_model_optimizer_sr_arguments(parser: argparse.ArgumentParser) -> argpars
         help="Initial backflow_scale parameter for AGP backflow models.",
     )
 
-    optimizer_group = parser.add_argument_group("Optimizer / SR")
-    optimizer_group.add_argument(
-        "--optimizer",
-        choices=("adam", "adamw", "sgd", "rmsprop"),
-        default="adam",
-        help="Outer optimizer used by nk.VMC after SR preconditioning.",
-    )
-    optimizer_group.add_argument(
-        "--optimizer-schedule",
-        choices=("warmup-cosine", "constant"),
-        default="warmup-cosine",
-        help="Learning-rate schedule for the outer optimizer.",
-    )
-    optimizer_group.add_argument("--learning-rate", type=float, default=5.0e-3)
-    optimizer_group.add_argument("--learning-rate-end", type=float, default=5.0e-5)
-    optimizer_group.add_argument(
-        "--optimizer-warmup-fraction",
-        type=float,
-        default=0.05,
-        help="Warmup fraction used by the warmup-cosine learning-rate schedule.",
-    )
-    optimizer_group.add_argument(
-        "--clip-grad-norm",
-        type=float,
-        default=1.0,
-        help="Global gradient clipping norm applied before the outer optimizer. <= 0 disables clipping.",
-    )
-    optimizer_group.add_argument(
-        "--optimizer-weight-decay",
-        type=float,
-        default=1.0e-4,
-        help="Weight decay used by adamw.",
-    )
-    optimizer_group.add_argument(
-        "--optimizer-momentum",
-        type=float,
-        default=0.0,
-        help="Momentum used by optax.sgd.",
-    )
-    optimizer_group.add_argument("--adam-b1", type=float, default=0.9)
-    optimizer_group.add_argument("--adam-b2", type=float, default=0.999)
-    optimizer_group.add_argument("--adam-eps", type=float, default=1.0e-8)
-    optimizer_group.add_argument("--rmsprop-decay", type=float, default=0.9)
-    optimizer_group.add_argument("--rmsprop-eps", type=float, default=1.0e-7)
-    optimizer_group.add_argument("--diag-shift", type=float, default=5.0e-2)
-    optimizer_group.add_argument("--diag-shift-end", type=float, default=1.0e-2)
-    optimizer_group.add_argument(
-        "--diag-shift-schedule",
-        choices=("linear", "constant"),
-        default="linear",
-        help="Schedule used for the SR diagonal shift.",
-    )
-    optimizer_group.add_argument(
-        "--diag-shift-transition-fraction",
-        type=float,
-        default=0.6,
-        help="Transition fraction used by the linear diag-shift schedule.",
-    )
-    optimizer_group.add_argument(
-        "--sr-solver",
-        choices=tuple(sorted(LINEAR_SOLVER_BUILDERS)),
-        default="pinv",
-        help="Linear solver used by nk.optimizer.SR.",
-    )
-    optimizer_group.add_argument(
-        "--sr-qgt",
-        choices=tuple(sorted(_SR_QGT_BUILDERS)),
-        default="QGTJacobianDense",
-        help="QGT implementation used by nk.optimizer.SR.",
-    )
-    optimizer_group.add_argument(
-        "--sr-holomorphic",
-        action="store_true",
-        default=False,
-        help="Pass holomorphic=True to nk.optimizer.SR.",
+    driver_group = parser.add_argument_group("Optimizer / driver")
+    add_vmc_driver_arguments(
+        driver_group,
+        driver_default="vmc-sr",
+        optimizer_choices=("adam", "adamw", "sgd", "rmsprop"),
+        optimizer_default="adam",
+        optimizer_schedule_default="warmup-cosine",
+        learning_rate_default=5.0e-3,
+        learning_rate_end_default=5.0e-5,
+        optimizer_warmup_fraction_default=0.05,
+        clip_grad_norm_default=1.0,
+        optimizer_weight_decay_default=1.0e-4,
+        optimizer_momentum_default=0.0,
+        diag_shift_default=5.0e-2,
+        linear_solver_default="cholesky",
+        mode_default="real",
     )
     return parser
+
+
+def add_model_optimizer_sr_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Backward-compatible alias for `add_model_driver_arguments`."""
+    return add_model_driver_arguments(parser)
 
 
 # ---------------------------------------------------------------------------
@@ -881,162 +938,6 @@ def build_hamiltonian(args):
         print(f"  kwargs: {builder_kwargs}")
     print(f"  hilbert: {_summarize_hilbert(hi)}")
     return H, hi
-
-
-# ---------------------------------------------------------------------------
-# Optimizer / SR helpers
-# ---------------------------------------------------------------------------
-def _legacy_get_optimizer_and_sr(steps: int = 300):
-    """Reproduce the historical hard-coded optimizer/SR configuration."""
-    warmup_steps = max(1, int(steps * 0.05))
-    lr_schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=0.005,
-        warmup_steps=warmup_steps,
-        decay_steps=max(1, steps),
-        end_value=5e-5,
-    )
-    op = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=lr_schedule),
-    )
-    sr_shift = optax.linear_schedule(
-        init_value=0.05,
-        end_value=0.01,
-        transition_steps=max(1, int(steps * 0.6)),
-    )
-    sr = nk.optimizer.SR(
-        diag_shift=sr_shift,
-        solver=nk.optimizer.solver.pinv,
-        holomorphic=False,
-        qgt=nk.optimizer.qgt.QGTJacobianDense,
-    )
-    return op, sr
-
-
-
-def _optimizer_learning_rate(steps: int, args):
-    """Build the learning-rate object consumed by the selected outer optimizer."""
-    if args.optimizer_schedule == "constant":
-        return float(args.learning_rate)
-
-    warmup_steps = max(1, int(max(1, steps) * float(args.optimizer_warmup_fraction)))
-    return optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=float(args.learning_rate),
-        warmup_steps=warmup_steps,
-        decay_steps=max(1, steps),
-        end_value=float(args.learning_rate_end),
-    )
-
-
-
-def _sr_diag_shift(steps: int, args):
-    """Build the diagonal-shift object consumed by `nk.optimizer.SR`."""
-    if args.diag_shift_schedule == "constant":
-        return float(args.diag_shift)
-
-    transition_steps = max(
-        1,
-        int(max(1, steps) * float(args.diag_shift_transition_fraction)),
-    )
-    return optax.linear_schedule(
-        init_value=float(args.diag_shift),
-        end_value=float(args.diag_shift_end),
-        transition_steps=transition_steps,
-    )
-
-
-
-def summarize_optimizer_and_sr_config(args) -> dict[str, object]:
-    """Package the CLI-controlled SIAM optimizer/SR settings into a summary dict."""
-    return {
-        "driver": "nk.VMC + nk.optimizer.SR",
-        "optimizer": args.optimizer,
-        "optimizer_schedule": args.optimizer_schedule,
-        "learning_rate": float(args.learning_rate),
-        "learning_rate_end": float(args.learning_rate_end),
-        "optimizer_warmup_fraction": float(args.optimizer_warmup_fraction),
-        "clip_grad_norm": float(args.clip_grad_norm),
-        "optimizer_weight_decay": float(args.optimizer_weight_decay),
-        "optimizer_momentum": float(args.optimizer_momentum),
-        "adam_b1": float(args.adam_b1),
-        "adam_b2": float(args.adam_b2),
-        "adam_eps": float(args.adam_eps),
-        "rmsprop_decay": float(args.rmsprop_decay),
-        "rmsprop_eps": float(args.rmsprop_eps),
-        "diag_shift": float(args.diag_shift),
-        "diag_shift_end": float(args.diag_shift_end),
-        "diag_shift_schedule": args.diag_shift_schedule,
-        "diag_shift_transition_fraction": float(args.diag_shift_transition_fraction),
-        "sr_solver": args.sr_solver,
-        "sr_qgt": args.sr_qgt,
-        "sr_holomorphic": bool(args.sr_holomorphic),
-    }
-
-
-
-def get_optimizer_and_sr(steps_or_args=300, args=None):
-    """Create the outer optimizer and SR preconditioner.
-
-    Backward compatibility:
-    - `get_optimizer_and_sr(steps)` keeps the historical hard-coded behavior.
-    - `get_optimizer_and_sr(args)` or `get_optimizer_and_sr(steps, args=args)`
-      uses the CLI-controlled optimizer/SR settings.
-    """
-    if args is None and hasattr(steps_or_args, "n_iter"):
-        args = steps_or_args
-        steps = int(args.n_iter)
-    elif args is None:
-        steps = int(steps_or_args)
-    else:
-        steps = int(steps_or_args)
-
-    if args is None or not hasattr(args, "optimizer"):
-        return _legacy_get_optimizer_and_sr(steps)
-
-    learning_rate = _optimizer_learning_rate(steps, args)
-
-    if args.optimizer == "adam":
-        op = optax.adam(
-            learning_rate=learning_rate,
-            b1=float(args.adam_b1),
-            b2=float(args.adam_b2),
-            eps=float(args.adam_eps),
-        )
-    elif args.optimizer == "adamw":
-        op = optax.adamw(
-            learning_rate=learning_rate,
-            b1=float(args.adam_b1),
-            b2=float(args.adam_b2),
-            eps=float(args.adam_eps),
-            weight_decay=float(args.optimizer_weight_decay),
-        )
-    elif args.optimizer == "sgd":
-        op = optax.sgd(
-            learning_rate=learning_rate,
-            momentum=float(args.optimizer_momentum),
-        )
-    elif args.optimizer == "rmsprop":
-        op = optax.rmsprop(
-            learning_rate=learning_rate,
-            decay=float(args.rmsprop_decay),
-            eps=float(args.rmsprop_eps),
-        )
-    else:
-        raise ValueError(f"Unsupported optimizer {args.optimizer!r}.")
-
-    clip_grad_norm = float(args.clip_grad_norm)
-    if clip_grad_norm > 0.0:
-        op = optax.chain(optax.clip_by_global_norm(clip_grad_norm), op)
-
-    sr = nk.optimizer.SR(
-        diag_shift=_sr_diag_shift(steps, args),
-        solver=LINEAR_SOLVER_BUILDERS[args.sr_solver],
-        holomorphic=bool(args.sr_holomorphic),
-        qgt=_SR_QGT_BUILDERS[args.sr_qgt],
-    )
-    return op, sr
 
 
 # ---------------------------------------------------------------------------

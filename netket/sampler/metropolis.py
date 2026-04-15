@@ -1,4 +1,4 @@
-# Copyright 2021 The NetKet Authors - All rights reserved.
+﻿# Copyright 2021 The NetKet Authors - All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -872,3 +872,70 @@ def MetropolisFermionHopWithProposal(
         spin_symmetric=spin_symmetric,
     )
     return MetropolisSampler(hilbert, rule, dtype=dtype, **kwargs)
+
+def MetropolisHamiltonianWithProposal(
+    hilbert,
+    hamiltonian,
+    *,
+    occupations=None,
+    balance_beta=0.5,
+    noise_strength=100.0,
+    mixing=0.05,
+    aggregate_duplicate_entries=False,
+    dtype=np.int8,
+    **kwargs,
+) -> MetropolisSampler:
+    r"""
+    Sampling based on the off-diagonal elements of a Hamiltonian, with
+    fermion occupation-biased proposal probabilities and move-type balancing.
+
+    Args:
+        hilbert: The Hilbert space to sample.
+        hamiltonian: The operator used to perform off-diagonal transitions.
+        occupations: Optional mean occupations for each fermion orbital or mode.
+            The accepted lengths are ``L`` and ``2L``. If ``2L`` is passed, the
+            order must match the fermion block order used by the joint sample:
+            ``[occ_dn(1), ..., occ_dn(L), occ_up(1), ..., occ_up(L)]``.
+            If ``None``, the fermion proposal stays neutral.
+        balance_beta: Soft-balancing parameter in ``[0, 1]`` controlling the
+            relative proposal mass assigned to spin-spin, fermion-fermion, and
+            joint spin-fermion moves. ``balance_beta=0`` with
+            ``occupations=None`` recovers the original uniform HamiltonianRule.
+        noise_strength: Beta-noise concentration parameter used when
+            ``occupations`` is provided.
+        mixing: Uniform mixing coefficient in ``[0, 1)`` used before Beta
+            resampling the occupations.
+        aggregate_duplicate_entries: If ``True``, explicitly sums proposal
+            probabilities of repeated connected entries leading to the same
+            target state when computing the MH correction. If ``False``
+            (default), uses a representative matching entry instead, which is
+            closer to the original HamiltonianRule treatment of connected
+            entries.
+        n_chains: The total number of independent Markov chains across all JAX
+            devices. Either specify this or `n_chains_per_rank`.
+        n_chains_per_rank: Number of independent chains on every JAX device
+            (default = 16).
+        sweep_size: Number of sweeps for each step along the chain. Defaults to
+            the number of sites in the Hilbert space. This is equivalent to
+            subsampling the Markov chain.
+        reset_chains: If True, resets the chain state when `reset` is called on
+            every new sampling (default = False).
+        machine_pow: The power to which the machine should be exponentiated to
+            generate the pdf (default = 2).
+        dtype: The dtype of the states sampled (default = np.int8).
+    """
+    from .rules.hamiltonian_with_proposal import HamiltonianRuleWithProposal
+
+    rule = HamiltonianRuleWithProposal(
+        hamiltonian,
+        occupations=occupations,
+        balance_beta=balance_beta,
+        noise_strength=noise_strength,
+        mixing=mixing,
+        aggregate_duplicate_entries=aggregate_duplicate_entries,
+    )
+    return MetropolisSampler(hilbert, rule, dtype=dtype, **kwargs)
+
+
+
+

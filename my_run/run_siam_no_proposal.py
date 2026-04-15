@@ -4,26 +4,28 @@ This entry point keeps only the baseline-specific choice:
 - standard fermion hopping proposals;
 - no occupation update;
 - no 1-RDM / natural-orbital rotation.
-All shared CLI, model resolution, and optimizer/SR wiring live in `_common.py`.
+All shared CLI, model resolution, and VMC/VMC_SR driver wiring live in `_common.py`.
 """
 from __future__ import annotations
 
 import netket as nk
 
 from _common import (
-    add_model_optimizer_sr_arguments,
+    add_model_driver_arguments,
     base_parser,
+    build_basic_optimizer,
     build_hamiltonian,
     build_mcstate,
     build_model,
+    build_vmc_or_vmc_sr_driver,
+    collect_vmc_driver_config,
     energy_summary,
-    get_optimizer_and_sr,
     graph_from_hamiltonian,
     namespace_snapshot,
     print_mapping,
     run_driver,
     summarize_model_config,
-    summarize_optimizer_and_sr_config,
+    validate_vmc_driver_args,
 )
 
 
@@ -33,7 +35,7 @@ def parse_args():
         "Hamiltonian VMC with standard MetropolisFermionHop. "
         "Select the initial (H, hi) with --hamiltonian-builder."
     )
-    add_model_optimizer_sr_arguments(parser)
+    add_model_driver_arguments(parser)
     return parser.parse_args()
 
 
@@ -54,11 +56,12 @@ def collect_runner_config(args) -> dict[str, object]:
 def main() -> int:
     """Build the SIAM system, then run one baseline VMC calculation per model."""
     args = parse_args()
+    validate_vmc_driver_args(args)
     H, hi = build_hamiltonian(args)
     graph = graph_from_hamiltonian(H)
 
     print_mapping("Runner settings:", collect_runner_config(args))
-    print_mapping("Optimizer/SR settings:", summarize_optimizer_and_sr_config(args))
+    print_mapping("Driver settings:", collect_vmc_driver_config(args))
 
     for requested_name in args.models:
         model = build_model(requested_name, hi, args)
@@ -75,13 +78,8 @@ def main() -> int:
         }
         print_mapping(f"\n[{requested_name}] model settings:", model_config)
 
-        op, sr = get_optimizer_and_sr(args)
-        driver = nk.VMC(
-            hamiltonian=H,
-            optimizer=op,
-            preconditioner=sr,
-            variational_state=vstate,
-        )
+        optimizer = build_basic_optimizer(args)
+        driver = build_vmc_or_vmc_sr_driver(H, vstate, optimizer, args)
         run_driver(driver, args)
 
         summary = energy_summary(H, vstate, driver)

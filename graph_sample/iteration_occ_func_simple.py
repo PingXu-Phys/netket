@@ -269,6 +269,28 @@ def get_optimizer_and_sr(steps: int = 300):
     return op, sr
 
 
+def _build_driver(hamiltonian, vstate, optimizer, sr, *, driver_builder=None):
+    """Instantiate either the default VMC driver or a caller-supplied builder."""
+    if driver_builder is not None:
+        return driver_builder(hamiltonian, vstate, optimizer)
+    return nk.VMC(
+        hamiltonian=hamiltonian,
+        optimizer=optimizer,
+        preconditioner=sr,
+        variational_state=vstate,
+    )
+
+
+def _set_driver_hamiltonian(driver, hamiltonian):
+    """Keep segmented drivers in sync when the effective Hamiltonian changes."""
+    if isinstance(driver, nk.VMC):
+        driver._ham = hamiltonian.collect()
+    elif isinstance(driver, nk.driver.VMC_SR):
+        driver._ham = hamiltonian
+    else:
+        driver._ham = getattr(hamiltonian, "collect", lambda: hamiltonian)()
+
+
 def _build_schedule(N_ITER: int, occ_update_every: int, schedule):
     """Convert user-provided schedule or update interval into a list of segment lengths."""
     if schedule is not None:
@@ -294,6 +316,7 @@ def run_vmc_with_iteration_occ(
     occ_init=None,
     op=None,
     sr=None,
+    driver_builder=None,
     N_ITER: int = 40,
     occ_update_every: int = 10,
     schedule: list[int] | None = None,
@@ -349,10 +372,7 @@ def run_vmc_with_iteration_occ(
         sampler=sampler, model=model,
         n_samples=n_samples, n_discard_per_chain=n_discard_per_chain,
     )
-    driver = nk.VMC(
-        hamiltonian=H, optimizer=op, preconditioner=sr,
-        variational_state=vstate,
-    )
+    driver = _build_driver(H, vstate, op, sr, driver_builder=driver_builder)
 
     # --- main loop ---
     occ_history = [occ.copy()]
@@ -409,6 +429,7 @@ def run_vmc_with_iteration_natural_orbitals(
     occ_init=None,
     op=None,
     sr=None,
+    driver_builder=None,
     N_ITER: int = 40,
     orbital_update_every: int = 20,
     schedule: list[int] | None = None,
@@ -474,10 +495,7 @@ def run_vmc_with_iteration_natural_orbitals(
         sampler=sampler, model=model,
         n_samples=n_samples, n_discard_per_chain=n_discard_per_chain,
     )
-    driver = nk.VMC(
-        hamiltonian=current_H, optimizer=op, preconditioner=sr,
-        variational_state=vstate,
-    )
+    driver = _build_driver(current_H, vstate, op, sr, driver_builder=driver_builder)
 
     occ_history = [occ.copy()]
     energy_history = []
@@ -524,7 +542,7 @@ def run_vmc_with_iteration_natural_orbitals(
             mode_rotation,
             cutoff=hamiltonian_cutoff,
         )
-        driver._ham = current_H.collect()
+        _set_driver_hamiltonian(driver, current_H)
 
         if update_graph_sampler:
             # Keep the proposal graph in sync with the rotated Hamiltonian.

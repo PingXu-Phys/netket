@@ -1,4 +1,4 @@
-"""Run Transformer+NNBF ansatzes on a Kondo-Heisenberg chain.
+﻿"""Run Transformer+NNBF ansatzes on a Kondo-Heisenberg chain.
 
 This entry point keeps only Kondo-Heisenberg specific decisions:
 - which Hamiltonian class to instantiate;
@@ -18,6 +18,7 @@ from pathlib import Path
 
 import netket as nk
 import numpy as np
+from netket.sampler.metropolis import MetropolisHamiltonianWithProposal
 from netket.sampler.rules.fermion_2nd_proposal import FermionHopRule_with_proposal
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -102,12 +103,12 @@ def parse_args() -> argparse.Namespace:
     model_group.add_argument('--mlp-ratio', type=int, default=4)
 
     sampler_group = parser.add_argument_group('Sampler')
-    sampler_group.add_argument('--joint-sampler', choices=('hamiltonian', 'factorized'), default='hamiltonian')
-    sampler_group.add_argument('--fermion-sampler', choices=('standard', 'with-proposal'), default='standard')
+    sampler_group.add_argument('--joint-sampler', choices=('hamiltonian', 'hamiltonian-with-proposal'), default='hamiltonian')
     sampler_group.add_argument('--proposal-occupations-file', type=str, default=None)
-    sampler_group.add_argument('--proposal-occupation-value', type=float, default=0.5)
+    sampler_group.add_argument('--proposal-occupation-value', type=float, default=None)
     sampler_group.add_argument('--proposal-noise-strength', type=float, default=100.0)
     sampler_group.add_argument('--proposal-mixing', type=float, default=0.05)
+    sampler_group.add_argument('--proposal-balance-beta', type=float, default=0.5)
 
     driver_group = parser.add_argument_group('Optimizer / driver')
     add_vmc_driver_arguments(
@@ -158,11 +159,8 @@ def validate_args(args: argparse.Namespace) -> None:
             'Use --joint-two-sz to seed the conserved joint sector instead.'
         )
 
-    if args.joint_sampler == 'hamiltonian' and args.fermion_sampler != 'standard':
-        raise ValueError(
-            '--fermion-sampler only applies to --joint-sampler factorized. '
-            'Use --joint-sampler factorized to enable with-proposal fermion hopping.'
-        )
+    if not 0.0 <= float(args.proposal_balance_beta) <= 1.0:
+        raise ValueError('--proposal-balance-beta must lie in the interval [0, 1].')
 
     validate_vmc_driver_args(args)
 
@@ -319,29 +317,37 @@ def _parse_occupations_text(payload: str) -> np.ndarray:
 
 
 
-def resolve_proposal_occupations(layout, args: argparse.Namespace) -> tuple[np.ndarray, dict]:
-    """Load or synthesize the proposal occupations used by the factorized sampler."""
+def resolve_proposal_occupations(layout, args: argparse.Namespace) -> tuple[np.ndarray | None, dict]:
+    """Load, synthesize, or disable the proposal occupations for HamiltonianWithProposal."""
     if args.proposal_occupations_file is not None:
         path = Path(args.proposal_occupations_file)
         occupations = _parse_occupations_text(path.read_text(encoding='utf-8'))
         source = str(path)
-    else:
+    elif args.proposal_occupation_value is not None:
         occupations = np.full(layout.n_sites, float(args.proposal_occupation_value), dtype=float)
         source = f'uniform:{args.proposal_occupation_value}'
+    else:
+        occupations = None
+        source = None
 
-    if occupations.ndim != 1:
-        raise ValueError('Proposal occupations must be a 1D array.')
-    if occupations.shape[0] not in (layout.n_sites, 2 * layout.n_sites):
-        raise ValueError(
-            'Proposal occupations must have length n_sites or 2*n_sites. '
-            f'Got {occupations.shape[0]}, expected {layout.n_sites} or {2 * layout.n_sites}.'
-        )
+    if occupations is not None:
+        if occupations.ndim != 1:
+            raise ValueError('Proposal occupations must be a 1D array.')
+        if occupations.shape[0] not in (layout.n_sites, 2 * layout.n_sites):
+            raise ValueError(
+                'Proposal occupations must have length n_sites or 2*n_sites. '
+                f'Got {occupations.shape[0]}, expected {layout.n_sites} or {2 * layout.n_sites}.'
+            )
+        occ_len = int(occupations.shape[0])
+    else:
+        occ_len = None
 
     return occupations, {
         'proposal_occupations_source': source,
-        'proposal_occupations_length': int(occupations.shape[0]),
+        'proposal_occupations_length': occ_len,
         'proposal_noise_strength': float(args.proposal_noise_strength),
         'proposal_mixing': float(args.proposal_mixing),
+        'proposal_balance_beta': float(args.proposal_balance_beta),
     }
 
 
@@ -432,9 +438,38 @@ def build_hamiltonian_sampler(system, args: argparse.Namespace):
         'proposal_occupations_length': None,
         'proposal_noise_strength': None,
         'proposal_mixing': None,
+        'proposal_balance_beta': None,
         'sampler_note': (
             'HamiltonianRule proposes moves from the full Kondo-Heisenberg operator '
             'and therefore preserves its exact connectivity and conserved sectors.'
+        ),
+    }
+
+
+
+def build_hamiltonian_with_proposal_sampler(system, layout, args: argparse.Namespace):
+    """Build the Hamiltonian-connected sampler with fermion proposal bias."""
+    occupations, proposal_info = resolve_proposal_occupations(layout, args)
+    sampler = MetropolisHamiltonianWithProposal(
+        system.joint_hilbert,
+        hamiltonian=system.hamiltonian,
+        occupations=occupations,
+        balance_beta=args.proposal_balance_beta,
+        noise_strength=args.proposal_noise_strength,
+        mixing=args.proposal_mixing,
+        n_chains_per_rank=args.n_chains_per_rank,
+        sweep_size=args.sweep_size,
+        reset_chains=False,
+    )
+    return sampler, {
+        'joint_sampler': 'hamiltonian-with-proposal',
+        'fermion_sampler': None,
+        'spin_rules': None,
+        **proposal_info,
+        'sampler_note': (
+            'HamiltonianRuleWithProposal keeps the full Kondo-Heisenberg connectivity, '
+            'biases fermion changes using the supplied occupations, and balances '
+            'ss/ff/sf proposal mass through --proposal-balance-beta.'
         ),
     }
 
@@ -444,7 +479,7 @@ def build_sampler(system, layout, args: argparse.Namespace):
     """Select the sampler branch requested by the CLI."""
     if args.joint_sampler == 'hamiltonian':
         return build_hamiltonian_sampler(system, args)
-    return build_factorized_sampler(system, layout, args)
+    return build_hamiltonian_with_proposal_sampler(system, layout, args)
 
 
 
@@ -461,12 +496,12 @@ def build_driver(system, vstate, optimizer, args: argparse.Namespace):
 
 
 def maybe_seed_joint_sector(system, layout, vstate, args: argparse.Namespace):
-    """Seed the conserved joint-Sz sector when the Hamiltonian sampler needs it."""
+    """Seed the conserved joint-Sz sector for the full-Hamiltonian samplers."""
     if layout.uses_block_determinant:
         return None
     if float(args.J_K) == 0.0:
         return None
-    if args.joint_sampler != 'hamiltonian':
+    if args.joint_sampler not in ('hamiltonian', 'hamiltonian-with-proposal'):
         return None
     return seed_joint_sz_sector(vstate, two_sz=args.joint_two_sz)
 
@@ -499,11 +534,11 @@ def print_tokenization_summary(system, layout, args: argparse.Namespace) -> None
     else:
         print('  only total fermion number fixed -> use one generalized determinant over all spin orbitals')
     print('Sampler path:')
-    print(f'  joint_sampler={args.joint_sampler}, fermion_sampler={args.fermion_sampler}')
-    if args.joint_sampler == 'factorized':
-        print('  factorized = TensorRule(fermion_rule, spin_rule, ...) on the tensor Hilbert')
-    else:
+    print(f'  joint_sampler={args.joint_sampler}')
+    if args.joint_sampler == 'hamiltonian':
         print('  hamiltonian = HamiltonianRule on the full joint operator')
+    else:
+        print('  hamiltonian-with-proposal = HamiltonianRuleWithProposal on the full joint operator')
     print('Driver path:')
     driver_info = collect_driver_config(args)
     print('  ' + ', '.join(f'{key}={value}' for key, value in driver_info.items()))
@@ -585,3 +620,6 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
+
+

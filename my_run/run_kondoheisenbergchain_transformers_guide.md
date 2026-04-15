@@ -1,44 +1,27 @@
-﻿# run_kondoheisenbergchain_transformers.py 接口说明
+﻿﻿# run_kondoheisenbergchain_transformers.py Interface Guide
 
-更新日期: 2026-04-15  
-对应脚本: `netket/run/run_kondoheisenbergchain_transformers.py`
+Updated: 2026-04-15
+Script: `netket/my_run/run_kondoheisenbergchain_transformers.py`
 
-## 1. 这份文档讲什么
+## 1. Scope
 
-这份文档只讲这一支 `run` 脚本当前的实际接口，重点说明:
+This document describes the actual current interface of the Kondo-Heisenberg runner:
 
-1. 物理参数和约束参数怎么传。
-2. 脚本什么时候走 blocked determinant，什么时候走 generalized determinant。
-3. `hamiltonian` 与 `factorized` 两种采样路径分别适合什么问题。
-4. 共享 optimizer / driver 参数现在怎样从 `_common.py` 流到 `VMC_SR`。
+1. how physical and sector parameters are passed
+2. when the model uses blocked or generalized determinants
+3. what `hamiltonian` and `hamiltonian-with-proposal` mean
+4. how proposal parameters flow into `MetropolisHamiltonianWithProposal(...)`
+5. how shared optimizer and driver options flow through `_common.py`
 
-## 2. 当前接口的核心结论
+## 2. Core rules
 
-- 如果只固定总电子数 `n_fermions`，模型走 generalized determinant。
-- 如果固定 `n_fermions_per_spin=(N_dn, N_up)`，模型走 blocked determinant。
-- `blocked determinant` 只在 `J_K = 0` 的情形下使用。
-- full Kondo 主线推荐入口是 `n_fermions + joint_two_sz + joint-sampler=hamiltonian`。
-- 当前推荐 driver 是 `vmc-sr`，optimizer 先用 `adam`。
-- `momentum=0.8` 现在已经由 runner 显式暴露。
-- `use_ntk` 和 `on_the_fly` 如果不显式传参，就会保留 `VMC_SR` 的自动策略。
-- 当前推荐路径里先不要使用 proposal 方案。
+- If only total fermion number `n_fermions` is fixed, the model uses the generalized determinant path.
+- If `n_fermions_per_spin=(N_dn, N_up)` is fixed, the model uses the blocked determinant path.
+- The blocked determinant path is only intended for `J_K = 0`.
+- The default full Kondo baseline is `n_fermions + joint_two_sz + joint-sampler=hamiltonian`.
+- To test the new sampler against the original rule, use `joint-sampler=hamiltonian-with-proposal`, no occupation input, and `proposal-balance-beta=0`.
 
-## 3. 共享参数和调用链
-
-这一版里，Kondo-Heisenberg runner 已经把共享 optimizer / driver 逻辑上提到 `_common.py`:
-
-- `_common.add_vmc_driver_arguments(...)`
-  统一加上 `--driver`、`--optimizer`、`--learning-rate`、`--diag-shift`、`--proj-reg`、`--momentum`、`--linear-solver`、`--mode`、`--use-ntk`、`--on-the-fly`。
-- `_common.validate_vmc_driver_args(args)`
-  统一拦截 `--driver vmc` 却还传 `momentum` / `proj_reg` / `linear_solver` 这类 `VMC_SR` 专用参数的错误组合。
-- `_common.collect_vmc_driver_config(args)`
-  统一把 driver 参数打包成 `summary.json` 和终端摘要。
-- `_common.build_basic_optimizer(args)`
-  统一构造轻量 runner 使用的 `adam` / `sgd`。
-- `_common.build_vmc_or_vmc_sr_driver(...)`
-  统一把这些参数真正流进 `nk.VMC` 或 `nk.driver.VMC_SR`。
-
-因此当前 KHC 的主调用链已经变成:
+## 3. Main call chain
 
 ```text
 parse_args
@@ -50,6 +33,7 @@ parse_args
 -> build_model
 -> build_sampler
 -> _common.build_mcstate
+-> maybe_seed_joint_sector
 -> build_optimizer
    -> _common.build_basic_optimizer
 -> build_driver
@@ -58,11 +42,11 @@ parse_args
 -> _common.save_model_artifacts / _common.write_json
 ```
 
-## 4. 参数接口
+## 4. Parameter groups
 
-### 4.1 Hamiltonian / sector
+### 4.1 Hamiltonian and sector arguments
 
-这些参数直接流向 `KondoHeisenbergChainSpinFermion(...)`:
+These flow into `KondoHeisenbergChainSpinFermion(...)`:
 
 - `--Lx`
 - `--t`
@@ -76,14 +60,14 @@ parse_args
 - `--joint-two-sz`
 - `--local-total-sz`
 
-其中边界最重要的一条是:
+Important constraint:
 
-- `J_K != 0` 时走 `--n-fermions`，也就是 generalized determinant。
-- `J_K = 0` 时才考虑 `--n-fermions-per-spin`，也就是 blocked determinant。
+- use `--n-fermions` when `J_K != 0`
+- use `--n-fermions-per-spin` only for the blocked, `J_K = 0` path
 
-### 4.2 Model
+### 4.2 Model arguments
 
-这些参数决定 Transformer+NNBF ansatz 的结构:
+These define the Transformer+NNBF ansatz:
 
 - `--models`
 - `--d-model`
@@ -91,26 +75,36 @@ parse_args
 - `--n-layers`
 - `--mlp-ratio`
 
-### 4.3 Sampler
+### 4.3 Sampler arguments
 
-- `--joint-sampler hamiltonian|factorized`
-- `--fermion-sampler standard|with-proposal`
+- `--joint-sampler hamiltonian|hamiltonian-with-proposal`
 - `--proposal-occupations-file`
 - `--proposal-occupation-value`
 - `--proposal-noise-strength`
 - `--proposal-mixing`
+- `--proposal-balance-beta`
 - `--d-max`
 - `--n-chains-per-rank`
 - `--sweep-size`
 
-当前推荐口径是:
+Meaning:
 
-- full Kondo 先用 `joint-sampler = hamiltonian`
-- 当前版本先不要打开 proposal 方案
+- `hamiltonian`
+  use the original `MetropolisHamiltonian(...)` with the exact full joint connectivity
+- `hamiltonian-with-proposal`
+  keep the same exact connectivity, then add fermion occupation bias plus `ss / ff / sf` soft balancing
+- `proposal-occupations-file`
+  read occupations from file; supported lengths are `L` and `2L`
+- `proposal-occupation-value`
+  build a constant length-`L` occupation vector for smoke tests
+- `proposal-balance-beta`
+  controls move-type balancing
+  - `0`: no extra balancing
+  - `1`: strongest balancing across non-empty move classes
 
-### 4.4 Optimizer / driver
+### 4.4 Optimizer and driver arguments
 
-这些参数现在统一由 `_common.add_vmc_driver_arguments(...)` 暴露:
+These are exposed by `_common.add_vmc_driver_arguments(...)`:
 
 - `--driver vmc|vmc-sr`
 - `--optimizer sgd|adam`
@@ -123,100 +117,134 @@ parse_args
 - `--use-ntk` / `--no-use-ntk`
 - `--on-the-fly` / `--no-on-the-fly`
 
-这里要分清两层:
+Notes:
 
-- `optimizer` 是外层参数更新器。当前推荐先用 `adam`。
-- `momentum` 是 `VMC_SR` 内部的 spring 参数，不是 `adam` 的动量。
+- `optimizer` is the outer parameter update rule
+- `momentum` is the internal spring parameter of `VMC_SR`, not Adam momentum
 
-如果你不显式传 `--use-ntk` / `--no-use-ntk`，脚本会把 `None` 直接传给 `VMC_SR`。
-同理，如果你不显式传 `--on-the-fly` / `--no-on-the-fly`，脚本也会保留 `VMC_SR` 的自动逻辑。
+## 5. Validation rules
 
-## 5. validate_args 现在会前置拦截什么
+The runner rejects the following combinations before system construction:
 
-脚本会在真正构造系统之前直接拒绝以下参数组合:
+- both `--n-fermions` and `--n-fermions-per-spin`
+- `--n-fermions-per-spin` when `J_K != 0`
+- `--local-total-sz` when `J_K != 0`
+- `--proposal-balance-beta` outside `[0, 1]`
+- `--driver vmc` together with SR-only options such as `--proj-reg`, `--momentum`, `--linear-solver`, `--use-ntk`, or `--on-the-fly`
 
-- 同时传 `--n-fermions` 和 `--n-fermions-per-spin`
-- `J_K != 0` 时再传 `--n-fermions-per-spin`
-- `J_K != 0` 时再传 `--local-total-sz`
-- `--joint-sampler hamiltonian` 时还传 `--fermion-sampler with-proposal`
-- `--driver vmc` 时还传 `--proj-reg`、`--momentum`、`--linear-solver`、`--use-ntk/--no-use-ntk`、`--on-the-fly/--no-on-the-fly`
-
-最后这一条现在已经实际验证过，入口会直接报:
-
-```text
-ValueError: --momentum only applies to --driver vmc-sr.
-```
-
-## 6. determinant backend 如何选择
+## 6. Determinant backend selection
 
 - `layout.uses_block_determinant == True`
-  说明 Hilbert 固定了 `n_dn` 和 `n_up`，模型走 blocked determinant。
+  means fixed `n_dn` and `n_up`, therefore blocked determinant
 - `layout.uses_block_determinant == False`
-  说明只固定了总电子数 `n_fermions`，模型走 generalized determinant。
+  means only fixed total fermion number, therefore generalized determinant
 
-当前建议非常明确:
+Recommended use:
 
-- full Kondo 主线用 generalized determinant
-- blocked determinant 只保留给 `J_K = 0` 的参考入口
+- generalized determinant for full Kondo calculations
+- blocked determinant only as a `J_K = 0` reference path
 
-## 7. 推荐命令
+## 7. Minimal command set
 
-### 7.1 full Kondo 主线
+### 7.1 Baseline
 
 ```powershell
-python run/run_kondoheisenbergchain_transformers.py \
-  --Lx 2 \
-  --J_K 1.0 \
-  --n-fermions 2 \
-  --joint-two-sz 0 \
-  --joint-sampler hamiltonian \
-  --models site-token \
-  --d-model 8 \
-  --n-heads 2 \
-  --n-layers 1 \
-  --mlp-ratio 2 \
-  --driver vmc-sr \
-  --optimizer adam \
-  --learning-rate 1e-2 \
-  --momentum 0.8 \
-  --n-iter 1 \
-  --n-samples 16 \
-  --n-discard-per-chain 0 \
-  --n-chains-per-rank 1 \
+python .\my_run\run_kondoheisenbergchain_transformers.py `
+  --Lx 2 `
+  --J_K 1.0 `
+  --n-fermions 2 `
+  --joint-two-sz 0 `
+  --joint-sampler hamiltonian `
+  --models site-token `
+  --d-model 8 `
+  --n-heads 2 `
+  --n-layers 1 `
+  --mlp-ratio 2 `
+  --driver vmc-sr `
+  --optimizer adam `
+  --learning-rate 1e-2 `
+  --momentum 0.8 `
+  --n-iter 1 `
+  --n-samples 16 `
+  --n-discard-per-chain 0 `
+  --n-chains-per-rank 1 `
   --no-progress
 ```
 
-### 7.2 `J_K = 0` 的 blocked 参考入口
+### 7.2 Neutral check of the new sampler
 
 ```powershell
-python run/run_kondoheisenbergchain_transformers.py \
-  --Lx 2 \
-  --J_K 0.0 \
-  --n-fermions-per-spin 1 1 \
-  --local-total-sz 0 \
-  --joint-sampler factorized \
-  --fermion-sampler standard \
-  --models site-token \
-  --d-model 8 \
-  --n-heads 2 \
-  --n-layers 1 \
-  --mlp-ratio 2 \
-  --driver vmc-sr \
-  --optimizer adam \
-  --learning-rate 1e-2 \
-  --momentum 0.8 \
-  --n-iter 1 \
-  --n-samples 16 \
-  --n-discard-per-chain 0 \
-  --n-chains-per-rank 1 \
+python .\my_run\run_kondoheisenbergchain_transformers.py `
+  --Lx 2 `
+  --J_K 1.0 `
+  --n-fermions 2 `
+  --joint-two-sz 0 `
+  --joint-sampler hamiltonian-with-proposal `
+  --proposal-balance-beta 0 `
+  --models site-token `
+  --d-model 8 `
+  --n-heads 2 `
+  --n-layers 1 `
+  --mlp-ratio 2 `
+  --driver vmc-sr `
+  --optimizer adam `
+  --learning-rate 1e-2 `
+  --momentum 0.8 `
+  --n-iter 1 `
+  --n-samples 16 `
+  --n-discard-per-chain 0 `
+  --n-chains-per-rank 1 `
   --no-progress
 ```
 
-## 8. 终端摘要和输出文件里现在能看到什么
+### 7.3 Proposal-enabled smoke test
 
-脚本启动后，终端和 `summary.json` 里现在会明确记录:
+```powershell
+python .\my_run\run_kondoheisenbergchain_transformers.py `
+  --Lx 2 `
+  --J_K 1.0 `
+  --n-fermions 2 `
+  --joint-two-sz 0 `
+  --joint-sampler hamiltonian-with-proposal `
+  --proposal-occupation-value 0.5 `
+  --proposal-noise-strength 100 `
+  --proposal-mixing 0.05 `
+  --proposal-balance-beta 0.5 `
+  --models site-token `
+  --d-model 8 `
+  --n-heads 2 `
+  --n-layers 1 `
+  --mlp-ratio 2 `
+  --driver vmc-sr `
+  --optimizer adam `
+  --learning-rate 1e-2 `
+  --momentum 0.8 `
+  --n-iter 1 `
+  --n-samples 16 `
+  --n-discard-per-chain 0 `
+  --n-chains-per-rank 1 `
+  --no-progress
+```
+
+## 8. Occupation file order
+
+If the file contains length `2L`, the required order is:
+
+```text
+[dn_1, ..., dn_L, up_1, ..., up_L]
+```
+
+## 9. What appears in terminal summaries and JSON
+
+The runner records at least:
 
 - `determinant_backend = blocked | generalized`
+- `joint_sampler = hamiltonian | hamiltonian-with-proposal`
+- `proposal_occupations_source`
+- `proposal_occupations_length`
+- `proposal_noise_strength`
+- `proposal_mixing`
+- `proposal_balance_beta`
 - `n_parameters`
 - `momentum`
 - `proj_reg`
@@ -224,4 +252,32 @@ python run/run_kondoheisenbergchain_transformers.py \
 - `use_ntk = auto|True|False`
 - `on_the_fly = auto|True|False`
 
-因此，主线 example 里“哪些参数是显式写的，哪些是没写吃默认”的状态，现在终端和 json 都能对应得上。
+## 10. Repeated connected entries
+
+This sampler uses the effective connected entries returned by `get_conn_padded(...)` as the proposal support. It does not deduplicate equal target states before assigning proposal mass.
+
+For a current state `?`, let the valid connected entries be `E(?)`, and let each entry `e` point to a target state `T_?(e)=?`. The actual proposal implemented by the code is
+
+```math
+q_{code}(?\mid?)
+=
+\sum_{e:T_?(e)=?}
+\frac{W_e(?)}{\sum_{e'\in E(?)} W_{e'}(?)}.
+```
+
+This means that repeated connected entries change the proposal shape: a target state that appears multiple times gets the sum of those entry probabilities.
+
+This does not invalidate the Metropolis sampler. The implementation computes the forward and backward proposal probabilities using the same effective `q_{code}`, including duplicates, by summing repeated entries with `_log_state_probability(...)`. Therefore the acceptance rule remains
+
+```math
+A(?\to?)
+=
+\min\left(
+1,
+\frac{|\Psi(?)|^2\,q_{code}(?\mid?)}{|\Psi(?)|^2\,q_{code}(?\mid?)}
+\right),
+```
+
+and the final stationary distribution is still `|?|^2`.
+
+The only thing duplicates change is the proposal itself. If a future version must realize an ideal proposal defined on unique target states, deduplication or an explicit multiplicity correction must be added before sampling.

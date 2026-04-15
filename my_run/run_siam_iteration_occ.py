@@ -4,7 +4,7 @@ This entry point keeps only the occupation-update specific logic:
 - split the run into segments;
 - estimate diagonal occupations from samples;
 - rebuild the proposal distribution after each segment.
-All shared CLI, model resolution, and optimizer/SR wiring live in `_common.py`.
+All shared CLI, model resolution, and VMC/VMC_SR driver wiring live in `_common.py`.
 """
 from __future__ import annotations
 
@@ -12,18 +12,20 @@ import netket as nk
 import numpy as np
 
 from _common import (
-    add_model_optimizer_sr_arguments,
+    add_model_driver_arguments,
     base_parser,
+    build_basic_optimizer,
     build_hamiltonian,
     build_mcstate,
     build_model,
+    build_vmc_or_vmc_sr_driver,
+    collect_vmc_driver_config,
     fmt,
-    get_optimizer_and_sr,
     graph_from_hamiltonian,
     namespace_snapshot,
     print_mapping,
     summarize_model_config,
-    summarize_optimizer_and_sr_config,
+    validate_vmc_driver_args,
 )
 from graph_sample.iteration_occ_func_simple import run_vmc_with_iteration_occ
 
@@ -49,7 +51,7 @@ def parse_args():
         "Hamiltonian VMC with occupation-updated proposal. "
         "Select the initial (H, hi) with --hamiltonian-builder."
     )
-    add_model_optimizer_sr_arguments(parser)
+    add_model_driver_arguments(parser)
     parser.add_argument(
         "--occ-update-every",
         type=int,
@@ -77,11 +79,15 @@ def collect_runner_config(args) -> dict[str, object]:
 def main() -> int:
     """Build the SIAM system, then run one occupation-update VMC calculation per model."""
     args = parse_args()
+    validate_vmc_driver_args(args)
     H, hi = build_hamiltonian(args)
     graph = graph_from_hamiltonian(H)
+    driver_builder = lambda hamiltonian, vstate, optimizer: build_vmc_or_vmc_sr_driver(  # noqa: E731
+        hamiltonian, vstate, optimizer, args
+    )
 
     print_mapping("Runner settings:", collect_runner_config(args))
-    print_mapping("Optimizer/SR settings:", summarize_optimizer_and_sr_config(args))
+    print_mapping("Driver settings:", collect_vmc_driver_config(args))
 
     for requested_name in args.models:
         model = build_model(requested_name, hi, args)
@@ -91,15 +97,15 @@ def main() -> int:
         }
         print_mapping(f"\n[{requested_name}] model settings:", model_config)
 
-        op, sr = get_optimizer_and_sr(args)
+        optimizer = build_basic_optimizer(args)
         result = run_vmc_with_iteration_occ(
             hi=hi,
             H=H,
             model=model,
             graph_sampler=graph,
             occ_init=np.full(hi.n_orbitals, 0.5),
-            op=op,
-            sr=sr,
+            op=optimizer,
+            driver_builder=driver_builder,
             N_ITER=args.n_iter,
             occ_update_every=args.occ_update_every,
             n_samples=args.n_samples,
