@@ -86,7 +86,7 @@ try:
         coerce_barrier_config,
     )
 except ImportError:
-    from optimize_no_core import (
+    from orbital_optimization.optimize_no_core import (
         create_optimizer,
         core_config_from_config,
         evaluate_with_loss,
@@ -94,7 +94,7 @@ except ImportError:
         prepare_base_context,
         resolve_post_no_rotation,
     )
-    from optimize_no_losses import (
+    from orbital_optimization.optimize_no_losses import (
         NOBarrierOptimizationConfig,
         build_barrier_loss_module,
         coerce_barrier_config,

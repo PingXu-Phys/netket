@@ -15,7 +15,7 @@ import optax
 from netket.operator._fermion2nd.base import FermionOperator2ndBase
 
 try:
-    from .iteration_occ_func_simple import (
+    from graph_sample.iteration_occ_func_simple import (
         _expand_orbital_rotation_to_modes,
         natural_orbitals_from_rdm,
         rotate_fermion_hamiltonian,

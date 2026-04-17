@@ -23,6 +23,14 @@ from netket.operator import DiscreteJaxOperator
 from netket.utils import struct
 
 from .hamiltonian import HamiltonianRuleBase
+from ._hamiltonian_with_proposal_local_descriptor import (
+    build_transition_signature,
+    compute_log_bias_from_descriptor,
+    compute_move_masks_from_descriptor,
+    extract_local_descriptor_from_dense_targets,
+    log_representative_probability_from_signature,
+    log_state_probability_from_signature,
+)
 
 
 def _infer_kondo_layout(hilbert):
@@ -118,46 +126,6 @@ def _sample_noisy_occupations(key, occupations, noise_strength, mixing, eps):
     return jax.random.beta(key, alpha, beta_param)
 
 
-def _classify_move_types(x, xp, valid, fermion_size):
-    """Split Hamiltonian-connected states into ss / ff / sf move classes."""
-    fermion_changed = jnp.any(xp[:, :fermion_size] != x[None, :fermion_size], axis=-1)
-    spin_changed = jnp.any(xp[:, fermion_size:] != x[None, fermion_size:], axis=-1)
-
-    mask_ss = valid & (~fermion_changed) & spin_changed
-    mask_ff = valid & fermion_changed & (~spin_changed)
-    mask_sf = valid & fermion_changed & spin_changed
-
-    group_idx = jnp.where(mask_ss, 0, jnp.where(mask_ff, 1, jnp.where(mask_sf, 2, -1)))
-    return mask_ss, mask_ff, mask_sf, group_idx
-
-
-def _compute_candidate_log_bias(x, xp, valid, occ, fermion_size, eps):
-    """Compute the fermion-only proposal bias for every connected candidate.
-
-    The bias only tracks which fermion modes change occupancy. Therefore it
-    automatically covers same-spin hops, on-site spin flips, and basis-rotated
-    one-body processes `c_a^dagger c_b`.
-    """
-    if occ is None:
-        return jnp.where(valid, 0.0, -jnp.inf)
-
-    x_f = x[None, :fermion_size]
-    xp_f = xp[:, :fermion_size]
-
-    add_mask = xp_f > x_f
-    remove_mask = x_f > xp_f
-
-    occ = jnp.clip(occ, eps, 1.0 - eps)
-    log_occ = jnp.log(occ)
-    log_one_minus_occ = jnp.log1p(-occ)
-
-    log_bias = jnp.sum(jnp.where(add_mask, log_occ[None, :], 0.0), axis=-1)
-    log_bias += jnp.sum(
-        jnp.where(remove_mask, log_one_minus_occ[None, :], 0.0), axis=-1
-    )
-    return jnp.where(valid, log_bias, -jnp.inf)
-
-
 def _compute_log_candidate_probabilities(
     log_bias, mask_ss, mask_ff, mask_sf, balance_beta
 ):
@@ -188,49 +156,26 @@ def _compute_log_candidate_probabilities(
     return jnp.where(valid, log_probs, -jnp.inf)
 
 
-def _log_state_probability(candidates, log_candidate_probs, target, valid):
-    """Return log q(target) while summing duplicate connected states if needed."""
-    same_state = jnp.all(candidates == target[None, :], axis=-1)
-    return logsumexp(jnp.where(valid & same_state, log_candidate_probs, -jnp.inf))
-
-
-def _log_representative_entry_probability(candidates, log_candidate_probs, target, valid):
-    """Return one matching entry probability without duplicate-state aggregation.
-
-    This matches the original HamiltonianRule philosophy more closely: connected
-    entries are treated as the primitive proposal objects, and repeated target
-    states are not explicitly aggregated at the acceptance-correction level.
-    For the current proposal construction, repeated entries leading to the same
-    target carry identical per-entry log-probabilities, so selecting the maximum
-    matching log-probability is equivalent to selecting any one representative
-    entry.
-    """
-    same_state = jnp.all(candidates == target[None, :], axis=-1)
-    return jnp.max(jnp.where(valid & same_state, log_candidate_probs, -jnp.inf))
-
-
-def _compute_chain_log_probs(x, xp, mels, occ, fermion_size, balance_beta, eps):
-    valid = jnp.abs(mels) > 0
-    mask_ss, mask_ff, mask_sf, group_idx = _classify_move_types(
-        x, xp, valid, fermion_size
-    )
-    log_bias = _compute_candidate_log_bias(x, xp, valid, occ, fermion_size, eps)
+def _compute_descriptor_log_probs(descriptor, occ, balance_beta, eps):
+    mask_ss, mask_ff, mask_sf = compute_move_masks_from_descriptor(descriptor)
+    log_bias = compute_log_bias_from_descriptor(descriptor, occ, eps)
     log_probs = _compute_log_candidate_probabilities(
         log_bias, mask_ss, mask_ff, mask_sf, balance_beta
     )
-    return log_probs, group_idx >= 0
+    return log_probs, descriptor.move_type >= 0
 
 
-def _compute_chain_log_probs_neutral(x, xp, mels, fermion_size, balance_beta):
+def _compute_chain_descriptor_and_log_probs(
+    x, xp, mels, occ, fermion_size, spin_size, balance_beta, eps
+):
     valid = jnp.abs(mels) > 0
-    mask_ss, mask_ff, mask_sf, group_idx = _classify_move_types(
-        x, xp, valid, fermion_size
+    descriptor = extract_local_descriptor_from_dense_targets(
+        x, xp, valid, fermion_size, spin_size
     )
-    log_bias = jnp.where(valid, 0.0, -jnp.inf)
-    log_probs = _compute_log_candidate_probabilities(
-        log_bias, mask_ss, mask_ff, mask_sf, balance_beta
+    log_probs, valid_descriptor = _compute_descriptor_log_probs(
+        descriptor, occ, balance_beta, eps
     )
-    return log_probs, group_idx >= 0
+    return descriptor, log_probs, valid_descriptor
 
 
 @struct.dataclass
@@ -316,8 +261,6 @@ class HamiltonianRuleWithProposalJax(HamiltonianRuleBase):
             log_prob_corr = jnp.log(n_conn) - jnp.log(n_conn_proposed)
             return x_proposed.astype(x.dtype), log_prob_corr
 
-        # Enumerate the exact Hamiltonian-connected support, just like the base
-        # HamiltonianRule. All proposal biasing happens only inside this support.
         xp, mels = self.operator.get_conn_padded(x)
         n_chains = x.shape[0]
         batch_i = jnp.arange(n_chains)
@@ -326,19 +269,21 @@ class HamiltonianRuleWithProposalJax(HamiltonianRuleBase):
         select_keys = jax.random.split(key_select, n_chains)
 
         if self.occupations is None:
-            log_probs_fwd, valid_fwd = jax.vmap(
-                _compute_chain_log_probs_neutral, in_axes=(0, 0, 0, None, None)
+            occ = None
+            descriptors_fwd, log_probs_fwd, valid_fwd = jax.vmap(
+                _compute_chain_descriptor_and_log_probs,
+                in_axes=(0, 0, 0, None, None, None, None, None),
             )(
                 x,
                 xp,
                 mels,
+                occ,
                 self.fermion_size,
+                self.spin_size,
                 self.balance_beta,
+                self.eps,
             )
-            occ = None
         else:
-            # Sample one noisy occupation profile per chain and reuse it for both
-            # the forward and backward proposal probabilities.
             occ_keys = jax.random.split(key_occ, n_chains)
             occupations = jnp.broadcast_to(
                 self.occupations, (n_chains, self.fermion_size)
@@ -352,63 +297,83 @@ class HamiltonianRuleWithProposalJax(HamiltonianRuleBase):
                 self.mixing,
                 self.eps,
             )
-            log_probs_fwd, valid_fwd = jax.vmap(
-                _compute_chain_log_probs, in_axes=(0, 0, 0, 0, None, None, None)
+            descriptors_fwd, log_probs_fwd, valid_fwd = jax.vmap(
+                _compute_chain_descriptor_and_log_probs,
+                in_axes=(0, 0, 0, 0, None, None, None, None),
             )(
                 x,
                 xp,
                 mels,
                 occ,
                 self.fermion_size,
+                self.spin_size,
                 self.balance_beta,
                 self.eps,
             )
 
         selected = jax.vmap(jax.random.categorical)(select_keys, log_probs_fwd)
         x_proposed = xp[batch_i, selected]
+        selected_signatures = jnp.take_along_axis(
+            descriptors_fwd.duplicate_signature, selected[:, None, None], axis=1
+        )[:, 0, :]
         if self.aggregate_duplicate_entries:
-            log_q_fwd = jax.vmap(_log_state_probability)(
-                xp, log_probs_fwd, x_proposed, valid_fwd
+            log_q_fwd = jax.vmap(log_state_probability_from_signature)(
+                descriptors_fwd.duplicate_signature,
+                log_probs_fwd,
+                selected_signatures,
+                valid_fwd,
             )
         else:
             log_q_fwd = jnp.take_along_axis(
                 log_probs_fwd, selected[:, None], axis=1
             )[:, 0]
 
-        # Recompute the reverse proposal on the proposed states using the same
-        # noisy occupations. This is the expensive part compared with the base
-        # HamiltonianRule, but it is required for the non-uniform proposal.
         xp_bwd, mels_bwd = self.operator.get_conn_padded(x_proposed)
         if occ is None:
-            log_probs_bwd, valid_bwd = jax.vmap(
-                _compute_chain_log_probs_neutral, in_axes=(0, 0, 0, None, None)
-            )(
-                x_proposed,
-                xp_bwd,
-                mels_bwd,
-                self.fermion_size,
-                self.balance_beta,
-            )
-        else:
-            log_probs_bwd, valid_bwd = jax.vmap(
-                _compute_chain_log_probs, in_axes=(0, 0, 0, 0, None, None, None)
+            descriptors_bwd, log_probs_bwd, valid_bwd = jax.vmap(
+                _compute_chain_descriptor_and_log_probs,
+                in_axes=(0, 0, 0, None, None, None, None, None),
             )(
                 x_proposed,
                 xp_bwd,
                 mels_bwd,
                 occ,
                 self.fermion_size,
+                self.spin_size,
+                self.balance_beta,
+                self.eps,
+            )
+        else:
+            descriptors_bwd, log_probs_bwd, valid_bwd = jax.vmap(
+                _compute_chain_descriptor_and_log_probs,
+                in_axes=(0, 0, 0, 0, None, None, None, None),
+            )(
+                x_proposed,
+                xp_bwd,
+                mels_bwd,
+                occ,
+                self.fermion_size,
+                self.spin_size,
                 self.balance_beta,
                 self.eps,
             )
 
+        target_signatures_bwd = jax.vmap(
+            build_transition_signature, in_axes=(0, 0, None, None)
+        )(x_proposed, x, self.fermion_size, self.spin_size)
         if self.aggregate_duplicate_entries:
-            log_q_bwd = jax.vmap(_log_state_probability)(
-                xp_bwd, log_probs_bwd, x, valid_bwd
+            log_q_bwd = jax.vmap(log_state_probability_from_signature)(
+                descriptors_bwd.duplicate_signature,
+                log_probs_bwd,
+                target_signatures_bwd,
+                valid_bwd,
             )
         else:
-            log_q_bwd = jax.vmap(_log_representative_entry_probability)(
-                xp_bwd, log_probs_bwd, x, valid_bwd
+            log_q_bwd = jax.vmap(log_representative_probability_from_signature)(
+                descriptors_bwd.duplicate_signature,
+                log_probs_bwd,
+                target_signatures_bwd,
+                valid_bwd,
             )
         return x_proposed.astype(x.dtype), log_q_bwd - log_q_fwd
 

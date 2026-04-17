@@ -1,4 +1,4 @@
-# `optimize_no` 架构与接口设计
+﻿# `optimize_no` 架构与接口设计
 
 > 文档定位：
 > 这份文件不再只是原版 `optimize_no.py` 的接口说明，而是整个 `optimize_no` 系列的统一设计文档。
@@ -159,10 +159,10 @@
 
 经过当前这轮重构，设计上已经不只是“未来目标”，而是有一部分已经落地：
 
-- [optimize_no_core.py](D:/Seafile/PHD/NQS/NetKet/netket/graph_sample/optimize_no_core.py)
-- [optimize_no_losses.py](D:/Seafile/PHD/NQS/NetKet/netket/graph_sample/optimize_no_losses.py)
-- [optimize_no_soft.py](D:/Seafile/PHD/NQS/NetKet/netket/graph_sample/optimize_no_soft.py)
-- [optimize_no_barrier.py](D:/Seafile/PHD/NQS/NetKet/netket/graph_sample/optimize_no_barrier.py)
+- [optimize_no_core.py](D:/Seafile/PHD/NQS/NetKet/netket/orbital_optimization/optimize_no_core.py)
+- [optimize_no_losses.py](D:/Seafile/PHD/NQS/NetKet/netket/orbital_optimization/optimize_no_losses.py)
+- [optimize_no_soft.py](D:/Seafile/PHD/NQS/NetKet/netket/orbital_optimization/optimize_no_soft.py)
+- [optimize_no_barrier.py](D:/Seafile/PHD/NQS/NetKet/netket/orbital_optimization/optimize_no_barrier.py)
 
 它们现在分别承担下面三层职责：
 
@@ -689,7 +689,7 @@ loss-specific 项只放进：
 典型调用：
 
 ```python
-from netket.graph_sample.optimize_no import (
+from netket.orbital_optimization.optimize_no import (
     NOOptimizationConfig,
     optimize_no_basis,
 )
@@ -739,7 +739,7 @@ result = optimize_no_basis(
 典型调用：
 
 ```python
-from netket.graph_sample.optimize_no_soft import (
+from netket.orbital_optimization.optimize_no_soft import (
     NOSoftOptimizationConfig,
     optimize_soft_basis,
 )
@@ -789,7 +789,7 @@ result = optimize_soft_basis(
 典型调用：
 
 ```python
-from netket.graph_sample.optimize_no_barrier import (
+from netket.orbital_optimization.optimize_no_barrier import (
     NOBarrierOptimizationConfig,
     optimize_barrier_basis,
 )
@@ -849,11 +849,11 @@ result = optimize_barrier_basis(
 典型写法：
 
 ```python
-from netket.graph_sample.optimize_no_core import (
+from netket.orbital_optimization.optimize_no_core import (
     prepare_base_context,
     optimize_with_loss,
 )
-from netket.graph_sample.optimize_no_losses import (
+from netket.orbital_optimization.optimize_no_losses import (
     NOSoftOptimizationConfig,
     build_soft_loss_module,
 )

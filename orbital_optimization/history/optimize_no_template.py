@@ -24,7 +24,7 @@ optimized_hamiltonian      : FermionOperator2nd（仅当传入 H 时有效）
 """
 
 import numpy as np
-from optimize_no import NOOptimizationConfig, optimize_no_basis
+from orbital_optimization.optimize_no import NOOptimizationConfig, optimize_no_basis
 
 # ──────────────────────────────────────────────
 # 1. 准备输入（替换成你自己的数据）
@@ -118,7 +118,7 @@ for entry in result["history"]:
 # 5. 快速诊断（可选）
 # ──────────────────────────────────────────────
 
-from optimize_no import evaluate_basis_metrics
+from orbital_optimization.optimize_no import evaluate_basis_metrics
 
 # 在任意旋转 U_test 下评估所有指标
 diag = evaluate_basis_metrics(

@@ -1,6 +1,6 @@
-# optimize_no 文档导航
+﻿# optimize_no 文档导航
 
-这份文档只做一件事：说明当前 `graph_sample` 目录里与 `optimize_no` / loss 设计有关的 Markdown 文件应该怎么读。
+这份文档只做一件事：说明当前 `orbital_optimization` 目录里与 `optimize_no` / loss 设计有关的 Markdown 文件应该怎么读。
 
 ---
 

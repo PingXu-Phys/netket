@@ -421,3 +421,79 @@ joint_sampler = 'hamiltonian'
 - `delta_z` 控制局域自旋交换项里的 XXZ 各向异性
 - `Lx` 和 `pbc` 决定键结构
 - `n_fermions`、`joint_two_sz` 决定 sector / 初始化，但不改变 Hamiltonian 的公式
+
+## 11. `FermionOperator2nd` warning 记录
+
+在一次只读的构造级接口检查里，NetKet 打印过类似下面的 warning：
+
+```text
+WARNING: Initializing `netket.operator.FermionOperator2nd` for a Hilbert space with a fixed number of fermions.
+Consider using `netket.experimental.operator.ParticleNumberConservingFermioperator2nd` to reduce the number of connected elements and considerably reduce the computational cost.
+```
+
+### 11.1 这是什么意思
+
+这不是物理错误，也不是接口错误，而是一个性能提示。
+
+它的意思是：
+
+- 当前某些费米子算符是用通用的 `FermionOperator2nd` 表示的
+- 但 Hilbert 空间已经固定了总电子数 `n_fermions`
+- 在这种情况下，NetKet 还有更专门的 conserving operator 实现，可以少枚举很多不可能的连通态
+- 因此如果换成专门实现，`get_conn(...)` 一类操作通常会更省内存、更快
+
+### 11.2 为什么当前 benchmark 里会看到它
+
+当前 benchmark 取的是：
+
+```python
+n_fermions = 4
+```
+
+所以电子部分的 Hilbert 空间确实带有固定总粒子数约束。
+
+而 Kondo-Heisenberg 链在构造总 Hamiltonian 时，内部会生成若干费米子子算符，例如：
+
+- 电子 hopping 项里的 `c_i^dagger c_j`
+- Kondo 项里的 `c_{i,up}^dagger c_{i,dn}` 和 `c_{i,dn}^dagger c_{i,up}`
+
+这些子算符在当前实现里仍可能走通用 `FermionOperator2nd` 路径，因此会触发这个提示。
+
+### 11.3 为什么现在可以先不处理
+
+对当前 benchmark 来说，这个 warning 可以先记录，不必立刻处理，原因是：
+
+- 它不表示 Hamiltonian 写错了
+- 它不表示采样器或 driver 接口有错
+- 它不会改变物理结果，只影响潜在计算效率
+- 当前 benchmark 规模很小，主要目标是接口正确、流程最小可跑
+
+因此现阶段把它视为“后续优化项”是合理的。
+
+### 11.4 后续若要优化，应当怎么做
+
+后续可以再单独检查：
+
+- 到底是哪些费米子子算符最频繁触发这个 warning
+- 是否能把其中一部分改写成 conserving fermionic operator
+- 是否值得在 Kondo 链实现里对纯费米子子块做更专门的表示
+
+但要注意：
+
+- 当前总 Hamiltonian 不是一个纯 fermion operator
+- 它还包含局域自旋部分，以及电子自旋与局域自旋之间的 Kondo 耦合
+- 因此不能简单地把“整个总 Hamiltonian”直接替换成一个纯费米子 conserving operator 类
+
+更现实的优化方向应当是：
+
+- 先定位 warning 的具体来源
+- 再判断是否只对纯费米子子块做局部替换
+
+### 11.5 当前结论
+
+当前文档先把这个 warning 记为：
+
+- `correctness`: 不构成错误
+- `priority`: 低到中
+- `type`: 性能优化候选项
+- `action now`: 记录，不立即修改
